@@ -1,0 +1,30 @@
+The file format for the tagging data is: each line contains a word SPACE tag pair. Blank lines are sentence boundaries. Your output files (testX.pos and testX.ner) should follow the same format.
+
+The assignment will be written in python, using the numpy package. We will be using Python 3.x, and the PyTorch package. You cannot use the higher-level packages such as Keras, torchtext, or smilar packages that creates high-level architectures for you. If you are in doubt about a package, ask Yoav if its allowed.
+Q&A
+
+If you have questions, please use the Moodle Q&A forum.
+How and What to submit?
+
+Use the submit system. The file should include a single attachment: a zip file called ID.zip or ID_ID.zip where ID is your ID number, and ID_ID is two ID numbers. The zip file should include the following files (see attachment decription for their content). Make sure to include your names and IDs also in the README file.
+
+    part1.pdf
+    tagger1.py
+    README
+    test1.pos
+    test1.ner
+    test.pred
+    part2.pdf
+    top_k.py
+    part3.pdf
+    tagger2.py
+    test3.pos
+    test3.ner
+    part4.pdf
+    tagger3.py
+    test4.pos
+    test4.ner
+    part5.pdf
+    tagger4.py
+    test5.pos
+    test5.ner

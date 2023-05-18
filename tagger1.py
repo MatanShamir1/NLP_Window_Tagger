@@ -1,9 +1,12 @@
 import torch
+import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
+import matplotlib.pyplot as plt
 
 EMBEDDING_DIMS = 50
+
 
 class Tagger(nn.Module):
     """
@@ -21,7 +24,7 @@ class Tagger(nn.Module):
     The vocabulary of E will be based on the words in the training set (you are not allowed to add to E words that appear only in the dev set).
     """
 
-    def __init__(self, task, words_vocabulary, tags_vocabulary, embedding_matrix, window_size=2):
+    def __init__(self, task, words_vocabulary, tags_vocabulary, embedding_matrix, words_idx_dict, window_size=2):
         super(Tagger, self).__init__()
 
         # 5 concat of 50 dimensional embedding vectors
@@ -29,98 +32,153 @@ class Tagger(nn.Module):
         hidden_size = 250
         output_size = len(tags_vocabulary)
         self.embedding_matrix = embedding_matrix
+        self.words_idx_dict = words_idx_dict
         self.input = nn.Linear(input_size, hidden_size)
         self.tanh = nn.Tanh()
         self.output = nn.Linear(hidden_size, output_size)
         self.softmax = nn.Softmax()
+        self.dropout = nn.Dropout()
 
     def forward(self, x, windows):
         # get embedding vector for input
-        x = idx_to_window_torch(x, windows, self.embedding_matrix)
+        x = self.lookups(x, windows)
         # x = self.embedding_matrix(x)
         x = self.input(x)
         x = self.tanh(x)
+        x = self.dropout(x)
         x = self.output(x)
-        x = self.softmax(x)
+        # x = self.softmax(x)
         return x
 
+    def lookups(self, indices, windows):
+        """
+        Convert a tensor of words indices to a tensor of word embeddings part of the same window.
+        this is like picking the right rows from the embedding matrix, aka lookup.
 
-def train_model(model, input_data, windows, epochs=1, lr=0.5):
+        Args:
+            idx (torch.Tensor): A tensor of word indices of shape (batch_size, window_size).
+            windows (int): The window size.
+            embedding_matrix (torch.Tensor): A tensor of word embeddings.
+
+        Returns:
+            torch.Tensor: A tensor of word embeddings of shape (batch_size, window_size * embedding_size).
+        """
+        embedding_size = embedding_matrix.embedding_dim
+        batch_size = indices.shape[0]
+
+        # Map the idx_to_window() function to each index in the tensor using PyTorch's map() function
+        windows = torch.tensor(list(map(lambda x: windows[x][0], indices.tolist())))
+        window_size = windows.size()[1]
+        # Use torch.reshape to flatten the tensor of windows into a 2D tensor
+        windows_flat = torch.reshape(windows, (batch_size, -1))
+
+        # Index into the embedding matrix to get the embeddings for each word in each window
+        # Add a check to ensure that the input word index is within the bounds of the embedding matrix
+        batch_embeddings = []
+        for i in range(batch_size):
+            window = windows_flat[i]
+            window_embeddings = []
+            for j in range(window_size):
+                word_idx = window[j].item()
+                # If the word index is a padding word, use zero vector as the embedding.
+                if word_idx == self.words_idx_dict["<PAD>"]:
+                    embedding_vec = torch.zeros((embedding_size,))
+                else:
+                    embedding_vec = embedding_matrix(torch.tensor(word_idx))
+                window_embeddings.append(embedding_vec)
+            batch_embeddings.append(torch.cat(window_embeddings))
+
+        # Use torch.stack to stack the tensor of embeddings into a 2D tensor
+        batch_embeddings = torch.stack(batch_embeddings)
+
+        return batch_embeddings
+
+
+def train_model(model, input_data, dev_data, windows, tags_idx_dict, epochs=1, lr=0.5):
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    model.train()
+    model.train() # set model to training mode
+
+    dev_loss_results = []
+    dev_acc_results = []
+    dev_acc_no_o_results = []
 
     for j in range(epochs):
         train_loader = DataLoader(
-            input_data, batch_size=32, shuffle=True, num_workers=4, pin_memory=True
+            input_data, batch_size=1, shuffle=True, num_workers=4, pin_memory=True
         )
         train_loss = 0
         for i, data in enumerate(train_loader, 0):
             x, y = data
             optimizer.zero_grad(set_to_none=True)
             y_hat = model.forward(x, windows)
-            # loss = loss_fn(y_hat, y)
-            # loss.backward()
-            loss = F.cross_entropy(y_hat, y)
+            loss = F.cross_entropy(y_hat, y)  # maybe don't need softmax and this does it alone
+            loss.backward()
             optimizer.step()
             train_loss += loss.item()
-        print(f"Epoch {j}, Loss: {train_loss/i}")
+            print(f"curr loss: {loss}")
+
+        dev_loss, dev_acc, dev_acc_clean = test_model(model, dev_data, tags_idx_dict)
+        dev_loss_results.append(dev_loss)
+        dev_acc_results.append(dev_acc)
+        dev_acc_no_o_results.append(dev_acc_clean)
+
+        print(
+            f"Epoch {j}/{epochs}, Loss: {train_loss / i}, Dev Loss: {dev_loss}, Dev Acc: {dev_acc} Acc No O:{dev_acc_clean}"
+        )
+    return dev_loss_results, dev_acc_results, dev_acc_no_o_results
 
 
-def test_model(model, input_data, windows):
-    model.eval()
-    total_loss = 0
-    for i, data in enumerate(input_data, 0):
-        x, y = data
-        y_hat = model.forward(x, windows)
-        loss = loss_fn(y_hat, y)
-        total_loss += loss.item()
-
-
-def idx_to_window_torch(idx, windows, embedding_matrix):
+def test_model(model, input_data, tags_idx_dict):
     """
-    Convert a tensor of word indices into a tensor of word embeddings
-    for a given window size and embedding matrix.
+    This function tests a PyTorch model on given input data and returns the validation loss, overall accuracy, and
+    accuracy excluding "O" labels. It takes in the following parameters:
 
-    Args:
-        idx (torch.Tensor): A tensor of word indices of shape (batch_size, window_size).
-        windows (int): The window size.
-        embedding_matrix (torch.Tensor): A tensor of word embeddings.
+    - model: a PyTorch model to be tested
+    - input_data: a dataset to test the model on
+    - windows: a parameter that is not used in the function
 
-    Returns:
-        torch.Tensor: A tensor of word embeddings of shape (batch_size, window_size * embedding_size).
+    The function first initializes a batch size of 32 and a global variable idx_to_label. It then creates a DataLoader
+    object with the input_data and the batch size, and calculates the validation loss, overall accuracy, and accuracy
+    excluding "O" labels. These values are returned as a tuple.
     """
-    embedding_size = embedding_matrix.embedding_dim
-    batch_size = idx.shape[0]
 
-    # Map the idx_to_window() function to each index in the tensor using PyTorch's map() function
-    windows = torch.tensor(list(map(lambda x: windows[x][0], idx.tolist())))
-    window_size = windows.size()[1]
-    # Use torch.reshape to flatten the tensor of windows into a 2D tensor
-    windows_flat = torch.reshape(windows, (batch_size, -1))
+    BATCH_SIZE = 32
 
-    # Index into the embedding matrix to get the embeddings for each word in each window
-    # Add a check to ensure that the input word index is within the bounds of the embedding matrix
-    embeddings = []
-    for i in range(batch_size):
-        window = windows_flat[i]
-        window_embeddings = []
-        for j in range(window_size):
-            word_idx = window[j].item()
-            if word_idx >= embedding_matrix.num_embeddings or word_idx == -1:
-                # If the word index is out of bounds, use the zero vector as the embedding
-                embed = torch.zeros((embedding_size,))
-            else:
-                embed = embedding_matrix(torch.tensor(word_idx))
-            window_embeddings.append(embed)
-        embeddings.append(torch.cat(window_embeddings))
+    loader = DataLoader(input_data, batch_size=BATCH_SIZE, shuffle=True)
+    running_val_loss = 0
+    with torch.no_grad():
+        model.eval()
+        count = 0
+        count_no_o = 0
+        to_remove = 0
+        for k, data in enumerate(loader, 0):
+            x, y = data
+            y_hat = model.forward(x)
+            # y_hat = dropout(y_hat)
+            val_loss = F.cross_entropy(y_hat, y)
+            # Create a list of predicted labels and actual labels
+            y_hat_labels = [i.item() for i in y_hat.argmax(dim=1)]
+            y_labels = [i.item() for i in y]
+            # Count the number of correct labels th
+            y_agreed = sum(
+                [
+                    1 if (i == j and j != tags_idx_dict["O"]) else 0
+                    for i, j in zip(y_hat_labels, y_labels)
+                ]
+            )
+            count += sum(y_hat.argmax(dim=1) == y).item()
+            count_no_o += y_agreed
+            to_remove += y_labels.count(tags_idx_dict["O"])
+            running_val_loss += val_loss.item()
 
-    # Use torch.stack to stack the tensor of embeddings into a 2D tensor
-    embeddings = torch.stack(embeddings)
+    return (
+        running_val_loss / k,
+        count / (k * BATCH_SIZE),
+        count_no_o / ((k * BATCH_SIZE) - to_remove),
+    )
 
-    return embeddings
 
-
-def read_tagged_file(file_name, window_size=2):
+def read_tagged_file(file_name, window_size=2, words_vocabulary=None, tags_vocabulary=None, file_type="train"):
     """
     Read data from a file and return token and label indices, vocabulary, and label vocabulary.
 
@@ -135,54 +193,120 @@ def read_tagged_file(file_name, window_size=2):
             - vocab (set): A set of unique tokens in the data.
             - labels_vocab (set): A set of unique labels in the data.
     """
-    words = []
-    tags = []
-    with open(file_name) as file:
-        word_tag_lines = file.readlines()
-        for word_tag_line in word_tag_lines:
-            word_tag_line = word_tag_line.strip()
-            if word_tag_line:
-                word, tag = word_tag_line.split()
-                words.append(word)
-                tags.append(tag)
+    all_words = []
+    all_tags = []
 
-    words_vocabulary = set(words)
-    words_vocabulary.add("<PAD>")  # add a padding token
-    words_vocabulary.add("<UUUNKKK>")  # add an unknown token
-    tags_vocabulary = set(tags)
+    with open(file_name) as f:
+        lines = f.readlines()
+        # lines = [line.strip() for line in lines if line.strip()]
+        words = []
+        tags = []
+        sentences = []
+        for line in lines:
+            if line == "\n":
+                sentences.append((np.array(words), np.array(tags)))
+                words = []
+                tags = []
+                continue
+            if file_type != "test":
+                if "ner" in file_name:
+                    word, tag = line.split('\t')
+                else:
+                    word, tag = line.split(' ')
+                word = word.strip()
+                tag = tag.strip()
+                all_tags.append(tag)
+                all_words.append(word)
+            else:
+                word = line.strip()
+                tag = ""
+            if any(char.isdigit() for char in word) and tag == "O":
+                word = "<NUM>"
+            words.append(word)
+            tags.append(tag)
+
+    if "ner" in file_name:
+        sentences = sentences[1:]  # remove docstart
+
+    if not words_vocabulary:
+        words_vocabulary = set(all_words)
+        words_vocabulary.add("<PAD>")  # add a padding token
+        words_vocabulary.add("<UUUNKKK>")  # add an unknown token
+
+    if not tags_vocabulary:
+        tags_vocabulary = set(all_tags)
 
     # Map words to their corresponding index in the vocabulary (word:idx)
     words_idx_dict = {word: i for i, word in enumerate(words_vocabulary)}
     tags_idx_dict = {tag: i for i, tag in enumerate(tags_vocabulary)}
 
     # For each window, map tokens to their index in the vocabulary
-    words_idx = [words_idx_dict[word] for word in words]
+    words_idx = [words_idx_dict[word] if word in words_idx_dict.keys() else words_idx_dict["<UUUNKKK>"] for word in all_words]
 
     # tokens_idx = torch.from_numpy(tokens_idx)
-    tags_idx = [tags_idx_dict[tag] for tag in tags]
+    tags_idx = [tags_idx_dict[tag] for tag in all_tags]
 
     # Create windows, each window will be of size window_size, padded with -1
     # for token of index i, w_i the window is: ([w_i-2,w_i-1 i, w_i+1,w_i+2],label of w_i)
     windows = []
-    for i in range(len(words)):
-        window = []
-        if i < window_size:
-            for j in range(window_size - i):
-                window.append(words_idx_dict["<PAD>"])
-        window.extend(words_idx[max(0, i - window_size):min(len(words_idx), i + window_size + 1)])
-        if i > len(words_idx) - window_size - 1:
-            for j in range(i - (len(words_idx) - window_size - 1)):
-                window.append(-1)
-        windows.append((window, tags_idx[i]))
 
-    return torch.tensor(words_idx), torch.tensor(tags_idx), windows, words_vocabulary, tags_vocabulary
+    for sentence in sentences:
+        words, tags = sentence
+        for i in range(len(words)):
+            window = []
+            if i < window_size:
+                for j in range(window_size - i):
+                    window.append(words_idx_dict["<PAD>"])
+            extra_words = words[max(0, i - window_size):min(len(words), i + window_size + 1)]
+            window.extend([words_idx_dict[word] if word in words_idx_dict.keys() else words_idx_dict["<UUUNKKK>"] for word in extra_words])
+            if i > len(words) - window_size - 1:
+                for j in range(i - (len(words) - window_size - 1)):
+                    window.append(words_idx_dict["<PAD>"])
+            windows.append((window, tags_idx_dict[tags[i]]))
+
+    return torch.tensor(words_idx), torch.tensor(tags_idx), windows, words_vocabulary,\
+           tags_vocabulary, words_idx_dict, tags_idx_dict
+
+
+def plot_results(dev_loss, dev_accuracy, dev_accuracy_no_o, task):
+    # # Plot the dev loss, and save
+    plt.plot(dev_loss, label="dev loss")
+    plt.title(f"{task} task")
+    plt.savefig(f"loss_{task}.png")
+    plt.show()
+
+    # # Plot the dev accuracy, and save
+    plt.plot(dev_accuracy, label="dev accuracy")
+    plt.title(f"{task} task")
+    plt.savefig(f"accuracy_{task}.png")
+    plt.show()
+
+    # # Plot the dev accuracy no O, and save
+    plt.plot(dev_accuracy_no_o, label="dev accuracy no o")
+    plt.title(f"{task} task")
+    plt.savefig(f"accuracy_no_O_{task}.png")
+    plt.show()
 
 
 if __name__ == "__main__":
-    words_idx, tags_idx, windows, words_vocabulary, tags_vocabulary = read_tagged_file("pos/train")
+
+    # preprocess data files
+    task = "pos"
+    words_idx, tags_idx, windows, words_vocabulary, tags_vocabulary, words_idx_dict, tags_idx_dict = read_tagged_file(
+        f"./{task}/train", file_type="train")
+    words_idx_dev, tags_idx_dev, windows_dev, _, _, _, _ = read_tagged_file(
+        f"./{task}/dev", words_vocabulary=words_vocabulary, tags_vocabulary=tags_vocabulary, file_type="dev")
+
+    # initialize model and embedding matrix and dataset
     embedding_matrix = nn.Embedding(len(words_vocabulary), EMBEDDING_DIMS)
-    # initialize the embedding matrix to random values using xavier initialization which is a good initialization for NLP tasks
     nn.init.xavier_uniform_(embedding_matrix.weight)
-    model = Tagger("pos", words_vocabulary, tags_vocabulary, embedding_matrix)
+    model = Tagger("pos", words_vocabulary, tags_vocabulary, embedding_matrix, words_idx_dict)
     dataset = TensorDataset(words_idx, tags_idx)
-    train_model(model, input_data=dataset, epochs=10, windows=windows)
+    dev_dataset = TensorDataset(words_idx_dev, tags_idx_dev)
+
+    # train model
+    dev_loss, dev_accuracy, dev_accuracy_no_o = train_model(
+        model, input_data=dataset, dev_data=dev_dataset, tags_idx_dict=tags_idx_dict, epochs=10, windows=windows)
+
+    # plot the results
+    plot_results(dev_loss, dev_accuracy, dev_accuracy_no_o, task)

@@ -33,18 +33,16 @@ def most_similar(word, vocab, vecs, k=5):
 
 
 if __name__ == "__main__":
-    to_check = ["dog", "england", "john", "explode", "office"]
-    # vocab = np.loadtxt("vocab.txt", dtype=str)
-    # vocab.tolist()
+    words_sim = ["dog", "england", "john", "explode", "office"]
     with open("vocab.txt", "r", encoding="utf-8") as file:
         vocab = file.readlines()
         vocab = [word.strip() for word in vocab]
     vecs = np.loadtxt("wordVectors.txt")
-    sim_dict = {word: most_similar(word, vocab, vecs) for word in to_check}
+    sim_dict = {word: most_similar(word, vocab, vecs) for word in words_sim}
     sim_dict_strings = {
         word: ([vocab[i] for i in sim_dict[word][0]], [i for i in sim_dict[word][1]])
-        for word in to_check
+        for word in words_sim
     }
-    for word in to_check:
+    for word in words_sim:
         for i, w in enumerate(sim_dict_strings[word][0]):
             print(f"{word} -> {w}, distance: {sim_dict_strings[word][1][i].round(4)}")

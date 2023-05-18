@@ -24,7 +24,7 @@ class Tagger(nn.Module):
     The vocabulary of E will be based on the words in the training set (you are not allowed to add to E words that appear only in the dev set).
     """
 
-    def __init__(self, task, words_vocabulary, tags_vocabulary, embedding_matrix, words_idx_dict, window_size=2):
+    def __init__(self, task, tags_vocabulary, embedding_matrix, window_size=2):
         super(Tagger, self).__init__()
 
         # 5 concat of 50 dimensional embedding vectors
@@ -32,16 +32,16 @@ class Tagger(nn.Module):
         hidden_size = 250
         output_size = len(tags_vocabulary)
         self.embedding_matrix = embedding_matrix
-        self.words_idx_dict = words_idx_dict
         self.input = nn.Linear(input_size, hidden_size)
         self.tanh = nn.Tanh()
         self.output = nn.Linear(hidden_size, output_size)
         self.softmax = nn.Softmax()
-        self.dropout = nn.Dropout()
+        self.dropout = nn.Dropout(p=0.3)
+        self.task = task
 
-    def forward(self, x, windows):
+    def forward(self, x):
         # get embedding vector for input
-        x = self.lookups(x, windows)
+        x = self.embedding_matrix(x).view(-1, 250)
         # x = self.embedding_matrix(x)
         x = self.input(x)
         x = self.tanh(x)
@@ -50,53 +50,11 @@ class Tagger(nn.Module):
         # x = self.softmax(x)
         return x
 
-    def lookups(self, indices, windows):
-        """
-        Convert a tensor of words indices to a tensor of word embeddings part of the same window.
-        this is like picking the right rows from the embedding matrix, aka lookup.
-
-        Args:
-            idx (torch.Tensor): A tensor of word indices of shape (batch_size, window_size).
-            windows (int): The window size.
-            embedding_matrix (torch.Tensor): A tensor of word embeddings.
-
-        Returns:
-            torch.Tensor: A tensor of word embeddings of shape (batch_size, window_size * embedding_size).
-        """
-        embedding_size = embedding_matrix.embedding_dim
-        batch_size = indices.shape[0]
-
-        # Map the idx_to_window() function to each index in the tensor using PyTorch's map() function
-        windows = torch.tensor(list(map(lambda x: windows[x][0], indices.tolist())))
-        window_size = windows.size()[1]
-        # Use torch.reshape to flatten the tensor of windows into a 2D tensor
-        windows_flat = torch.reshape(windows, (batch_size, -1))
-
-        # Index into the embedding matrix to get the embeddings for each word in each window
-        # Add a check to ensure that the input word index is within the bounds of the embedding matrix
-        batch_embeddings = []
-        for i in range(batch_size):
-            window = windows_flat[i]
-            window_embeddings = []
-            for j in range(window_size):
-                word_idx = window[j].item()
-                # If the word index is a padding word, use zero vector as the embedding.
-                if word_idx == self.words_idx_dict["<PAD>"]:
-                    embedding_vec = torch.zeros((embedding_size,))
-                else:
-                    embedding_vec = embedding_matrix(torch.tensor(word_idx))
-                window_embeddings.append(embedding_vec)
-            batch_embeddings.append(torch.cat(window_embeddings))
-
-        # Use torch.stack to stack the tensor of embeddings into a 2D tensor
-        batch_embeddings = torch.stack(batch_embeddings)
-
-        return batch_embeddings
-
-
-def train_model(model, input_data, dev_data, windows, tags_idx_dict, epochs=1, lr=0.5):
+def train_model(model, input_data, dev_data, tags_idx_dict, epochs=1, lr=0.0001):
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     model.train() # set model to training mode
+
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
 
     dev_loss_results = []
     dev_acc_results = []
@@ -104,18 +62,18 @@ def train_model(model, input_data, dev_data, windows, tags_idx_dict, epochs=1, l
 
     for j in range(epochs):
         train_loader = DataLoader(
-            input_data, batch_size=1, shuffle=True, num_workers=4, pin_memory=True
+            input_data, batch_size=1024, shuffle=True, num_workers=4, pin_memory=True
         )
         train_loss = 0
         for i, data in enumerate(train_loader, 0):
             x, y = data
             optimizer.zero_grad(set_to_none=True)
-            y_hat = model.forward(x, windows)
+            y_hat = model.forward(x)
             loss = F.cross_entropy(y_hat, y)  # maybe don't need softmax and this does it alone
             loss.backward()
             optimizer.step()
             train_loss += loss.item()
-            print(f"curr loss: {loss}")
+            # print(f"iteration {i} curr loss: {loss}")
 
         dev_loss, dev_acc, dev_acc_clean = test_model(model, dev_data, tags_idx_dict)
         dev_loss_results.append(dev_loss)
@@ -123,8 +81,9 @@ def train_model(model, input_data, dev_data, windows, tags_idx_dict, epochs=1, l
         dev_acc_no_o_results.append(dev_acc_clean)
 
         print(
-            f"Epoch {j}/{epochs}, Loss: {train_loss / i}, Dev Loss: {dev_loss}, Dev Acc: {dev_acc} Acc No O:{dev_acc_clean}"
+            f"Epoch {j+1}/{epochs}, Loss: {train_loss / i}, Dev Loss: {dev_loss}, Dev Acc: {dev_acc} Acc No O:{dev_acc_clean}"
         )
+        scheduler.step()
     return dev_loss_results, dev_acc_results, dev_acc_no_o_results
 
 
@@ -142,7 +101,7 @@ def test_model(model, input_data, tags_idx_dict):
     excluding "O" labels. These values are returned as a tuple.
     """
 
-    BATCH_SIZE = 32
+    BATCH_SIZE = 1024
 
     loader = DataLoader(input_data, batch_size=BATCH_SIZE, shuffle=True)
     running_val_loss = 0
@@ -160,15 +119,24 @@ def test_model(model, input_data, tags_idx_dict):
             y_hat_labels = [i.item() for i in y_hat.argmax(dim=1)]
             y_labels = [i.item() for i in y]
             # Count the number of correct labels th
-            y_agreed = sum(
-                [
-                    1 if (i == j and j != tags_idx_dict["O"]) else 0
-                    for i, j in zip(y_hat_labels, y_labels)
-                ]
-            )
+            if model.task == "ner":
+                y_agreed = sum(
+                    [
+                        1 if (i == j and j != tags_idx_dict["O"]) else 0
+                        for i, j in zip(y_hat_labels, y_labels)
+                    ]
+                )
+            else:
+                y_agreed = sum(
+                    [
+                        1 if (i == j) else 0
+                        for i, j in zip(y_hat_labels, y_labels)
+                    ]
+                )
             count += sum(y_hat.argmax(dim=1) == y).item()
             count_no_o += y_agreed
-            to_remove += y_labels.count(tags_idx_dict["O"])
+            if model.task == "ner":
+                to_remove += y_labels.count(tags_idx_dict["O"])
             running_val_loss += val_loss.item()
 
     return (
@@ -288,6 +256,7 @@ def plot_results(dev_loss, dev_accuracy, dev_accuracy_no_o, task):
     plt.show()
 
 
+
 if __name__ == "__main__":
 
     # preprocess data files
@@ -300,13 +269,15 @@ if __name__ == "__main__":
     # initialize model and embedding matrix and dataset
     embedding_matrix = nn.Embedding(len(words_vocabulary), EMBEDDING_DIMS)
     nn.init.xavier_uniform_(embedding_matrix.weight)
-    model = Tagger("pos", words_vocabulary, tags_vocabulary, embedding_matrix, words_idx_dict)
-    dataset = TensorDataset(words_idx, tags_idx)
-    dev_dataset = TensorDataset(words_idx_dev, tags_idx_dev)
+    model = Tagger("pos", tags_vocabulary, embedding_matrix)
+    word_window_idx = torch.tensor([window for window, tag in windows])
+    word_window_idx_dev = torch.tensor([window for window, tag in windows_dev])
+    dataset = TensorDataset(word_window_idx, tags_idx)
+    dev_dataset = TensorDataset(word_window_idx_dev, tags_idx_dev)
 
     # train model
     dev_loss, dev_accuracy, dev_accuracy_no_o = train_model(
-        model, input_data=dataset, dev_data=dev_dataset, tags_idx_dict=tags_idx_dict, epochs=10, windows=windows)
+        model, input_data=dataset, dev_data=dev_dataset, tags_idx_dict=tags_idx_dict, epochs=10)
 
     # plot the results
     plot_results(dev_loss, dev_accuracy, dev_accuracy_no_o, task)

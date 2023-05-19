@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 import matplotlib.pyplot as plt
+import sys
 
 EMBEDDING_DIMS = 50
 
@@ -35,7 +36,7 @@ class Tagger(nn.Module):
         self.input = nn.Linear(input_size, hidden_size)
         self.tanh = nn.Tanh()
         self.output = nn.Linear(hidden_size, output_size)
-        self.softmax = nn.Softmax()
+        self.softmax = nn.Softmax(dim=1)
         self.dropout = nn.Dropout(p=0.3)
         self.task = task
 
@@ -54,7 +55,7 @@ def train_model(model, input_data, dev_data, tags_idx_dict, epochs=1, lr=0.0001)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     model.train() # set model to training mode
 
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
+    # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
 
     dev_loss_results = []
     dev_acc_results = []
@@ -83,7 +84,7 @@ def train_model(model, input_data, dev_data, tags_idx_dict, epochs=1, lr=0.0001)
         print(
             f"Epoch {j+1}/{epochs}, Loss: {train_loss / i}, Dev Loss: {dev_loss}, Dev Acc: {dev_acc} Acc No O:{dev_acc_clean}"
         )
-        scheduler.step()
+        # scheduler.step()
     return dev_loss_results, dev_acc_results, dev_acc_no_o_results
 
 
@@ -146,7 +147,43 @@ def test_model(model, input_data, tags_idx_dict):
     )
 
 
-def read_tagged_file(file_name, window_size=2, words_vocabulary=None, tags_vocabulary=None, file_type="train"):
+def create_test_predictions(model, input_data, task, idx_tags_dict, all_test_words):
+    """
+    This function tests a PyTorch model on given input data and returns the validation loss, overall accuracy, and
+    accuracy excluding "O" labels. It takes in the following parameters:
+
+    - model: a PyTorch model to be tested
+    - input_data: a dataset to test the model on
+    - windows: a parameter that is not used in the function
+
+    The function first initializes a batch size of 32 and a global variable idx_to_label. It then creates a DataLoader
+    object with the input_data and the batch size, and calculates the validation loss, overall accuracy, and accuracy
+    excluding "O" labels. These values are returned as a tuple.
+    """
+
+    BATCH_SIZE = 256
+
+    loader = DataLoader(input_data, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
+    predictions = []
+    with torch.no_grad():
+        model.eval()
+        j = 0
+        for _, data in enumerate(loader, 0):
+            x, y = data
+            y_hat = model.forward(x)
+            y_hat = model.softmax(y_hat)
+            x_words = [all_test_words[i + j] for i, _ in enumerate(x)]
+            y_hat_labels = [idx_tags_dict[i.item()] for i in y_hat.argmax(dim=1)]
+            predictions.extend(zip(x_words, y_hat_labels))
+            j += BATCH_SIZE
+
+    with open(f"test1.{task}", "w") as f:
+        for pred in predictions:
+            f.write(f"{pred[0]} {pred[1]}" + "\n")
+
+
+def read_tagged_file(file_name, window_size=2, words_vocabulary=None, tags_vocabulary=None, file_type="train",
+                     pretrained_words_vocab=None, embedding_vecs=embedding_vecs):
     """
     Read data from a file and return token and label indices, vocabulary, and label vocabulary.
 
@@ -181,26 +218,26 @@ def read_tagged_file(file_name, window_size=2, words_vocabulary=None, tags_vocab
                     word, tag = line.split('\t')
                 else:
                     word, tag = line.split(' ')
-                word = word.strip()
+                word = word.strip().lower()
                 tag = tag.strip()
                 all_tags.append(tag)
-                all_words.append(word)
             else:
                 word = line.strip()
                 tag = ""
             if any(char.isdigit() for char in word) and tag == "O":
                 word = "<NUM>"
+            all_words.append(word)
             words.append(word)
             tags.append(tag)
-
-    if "ner" in file_name:
-        sentences = sentences[1:]  # remove docstart
 
     if not words_vocabulary:
         words_vocabulary = set(all_words)
         words_vocabulary.add("<PAD>")  # add a padding token
         words_vocabulary.add("<UUUNKKK>")  # add an unknown token
-
+        if pretrained_words_vocab:
+            train_missing_embeddings = [word for word in words_vocabulary if word not in pretrained_words_vocab]
+            pretrained_words_vocab = [(word, vec for word, vec in zip(pretrained_words_vocab, embedding_vecs))]
+            # pretrained_words_vocab.extend([word])
     if not tags_vocabulary:
         tags_vocabulary = set(all_tags)
 
@@ -230,54 +267,98 @@ def read_tagged_file(file_name, window_size=2, words_vocabulary=None, tags_vocab
             if i > len(words) - window_size - 1:
                 for j in range(i - (len(words) - window_size - 1)):
                     window.append(words_idx_dict["<PAD>"])
-            windows.append((window, tags_idx_dict[tags[i]]))
+            if file_type == "test":
+                windows.append((window, 0))
+            else:
+                windows.append((window, tags_idx_dict[tags[i]]))
 
-    return torch.tensor(words_idx), torch.tensor(tags_idx), windows, words_vocabulary,\
-           tags_vocabulary, words_idx_dict, tags_idx_dict
+    return torch.tensor(tags_idx), windows, words_vocabulary, tags_vocabulary, tags_idx_dict, all_words
 
 
 def plot_results(dev_loss, dev_accuracy, dev_accuracy_no_o, task):
     # # Plot the dev loss, and save
-    plt.plot(dev_loss, label="dev loss")
+    plt.plot(dev_loss, label=f"{task} dev loss")
     plt.title(f"{task} task")
-    plt.savefig(f"loss_{task}.png")
+    plt.savefig(f"{task}_loss.jpg")
     plt.show()
 
     # # Plot the dev accuracy, and save
-    plt.plot(dev_accuracy, label="dev accuracy")
+    plt.plot(dev_accuracy, label=f"{task} dev accuracy")
     plt.title(f"{task} task")
-    plt.savefig(f"accuracy_{task}.png")
+    plt.savefig(f"{task}_accuracy.jpg")
     plt.show()
 
-    # # Plot the dev accuracy no O, and save
-    plt.plot(dev_accuracy_no_o, label="dev accuracy no o")
-    plt.title(f"{task} task")
-    plt.savefig(f"accuracy_no_O_{task}.png")
-    plt.show()
+    if task == "ner":
+        # # Plot the dev accuracy no O, and save
+        plt.plot(dev_accuracy_no_o, label=f"{task} dev accuracy without O")
+        plt.title(f"{task} task")
+        plt.savefig(f"{task}_without_O_accuracy.jpg")
+        plt.show()
 
 
+def load_pretrained_embedding(vocab_path, word_vectors_path):
+    with open(vocab_path, "r", encoding="utf-8") as file:
+        vocab = file.readlines()
+        vocab = [word.strip() for word in vocab]
+        vocab = set(vocab)
+    vecs = np.loadtxt(word_vectors_path)
+    vecs = torch.from_numpy(vecs)
+    vecs = vecs.float()
+    return vocab, vecs
 
-if __name__ == "__main__":
 
-    # preprocess data files
-    task = "pos"
-    words_idx, tags_idx, windows, words_vocabulary, tags_vocabulary, words_idx_dict, tags_idx_dict = read_tagged_file(
-        f"./{task}/train", file_type="train")
-    words_idx_dev, tags_idx_dev, windows_dev, _, _, _, _ = read_tagged_file(
+def run(embed, task):
+
+    if embed == "pre":
+        words_embedding_vocabulary, embedding_vecs = load_pretrained_embedding("vocab.txt", "wordVectors.txt")
+        tags_idx, windows, words_vocabulary, tags_vocabulary, tags_idx_dict, _ = read_tagged_file(
+            f"./{task}/train", file_type="train", pretrained_words_vocab=words_embedding_vocabulary, embedding_vecs=embedding_vecs)
+
+        embedding_matrix = nn.Embedding.from_pretrained(embedding_vecs, freeze=False)
+    else:
+        tags_idx, windows, words_vocabulary, tags_vocabulary, tags_idx_dict, _ = read_tagged_file(
+            f"./{task}/train", file_type="train")
+
+        # initialize model and embedding matrix and dataset
+        embedding_matrix = nn.Embedding(len(words_vocabulary), EMBEDDING_DIMS)
+        nn.init.xavier_uniform_(embedding_matrix.weight)
+
+
+    tags_idx_dev, windows_dev, _, _, _, _ = read_tagged_file(
         f"./{task}/dev", words_vocabulary=words_vocabulary, tags_vocabulary=tags_vocabulary, file_type="dev")
 
-    # initialize model and embedding matrix and dataset
-    embedding_matrix = nn.Embedding(len(words_vocabulary), EMBEDDING_DIMS)
-    nn.init.xavier_uniform_(embedding_matrix.weight)
-    model = Tagger("pos", tags_vocabulary, embedding_matrix)
+    model = Tagger(task, tags_vocabulary, embedding_matrix)
     word_window_idx = torch.tensor([window for window, tag in windows])
     word_window_idx_dev = torch.tensor([window for window, tag in windows_dev])
     dataset = TensorDataset(word_window_idx, tags_idx)
     dev_dataset = TensorDataset(word_window_idx_dev, tags_idx_dev)
 
+    lr = 0.0006
+    epochs = 10
+
+    if task == "pos":
+        lr = 0.0001
+        epochs = 15
+
     # train model
     dev_loss, dev_accuracy, dev_accuracy_no_o = train_model(
-        model, input_data=dataset, dev_data=dev_dataset, tags_idx_dict=tags_idx_dict, epochs=10)
+        model, input_data=dataset, dev_data=dev_dataset, tags_idx_dict=tags_idx_dict, epochs=epochs, lr=lr)
 
     # plot the results
     plot_results(dev_loss, dev_accuracy, dev_accuracy_no_o, task)
+
+    print("Test")
+    _, windows_test, _, _, _, all_test_words = \
+        read_tagged_file(f"./{task}/test", words_vocabulary=words_vocabulary, tags_vocabulary=tags_vocabulary,
+                         file_type="test")
+
+    word_window_idx_test = torch.tensor([window for window, tag in windows_test])
+    test_dataset = TensorDataset(word_window_idx_test, torch.tensor([0] * len(word_window_idx_test)))
+    idx_tags_dict = {i: tag for i, tag in enumerate(tags_vocabulary)}
+
+    create_test_predictions(model, test_dataset, task, idx_tags_dict, all_test_words)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] in ["pre", "rand"] and sys.argv[2] in ["ner", "pos"]:
+        run(sys.argv[1], sys.argv[2])

@@ -51,9 +51,10 @@ class Tagger(nn.Module):
         # x = self.softmax(x)
         return x
 
+
 def train_model(model, input_data, dev_data, tags_idx_dict, epochs=1, lr=0.0001):
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    model.train() # set model to training mode
+    model.train()  # set model to training mode
 
     # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
 
@@ -82,7 +83,7 @@ def train_model(model, input_data, dev_data, tags_idx_dict, epochs=1, lr=0.0001)
         dev_acc_no_o_results.append(dev_acc_clean)
 
         print(
-            f"Epoch {j+1}/{epochs}, Loss: {train_loss / i}, Dev Loss: {dev_loss}, Dev Acc: {dev_acc} Acc No O:{dev_acc_clean}"
+            f"Epoch {j + 1}/{epochs}, Loss: {train_loss / i}, Dev Loss: {dev_loss}, Dev Acc: {dev_acc} Acc No O:{dev_acc_clean}"
         )
         # scheduler.step()
     return dev_loss_results, dev_acc_results, dev_acc_no_o_results
@@ -183,7 +184,7 @@ def create_test_predictions(model, input_data, task, idx_tags_dict, all_test_wor
 
 
 def read_tagged_file(file_name, window_size=2, words_vocabulary=None, tags_vocabulary=None, file_type="train",
-                     pretrained_words_vocab=None, embedding_vecs=embedding_vecs):
+                     pretrained_words_vocab=None, embedding_vecs=None, is_pretrained=False):
     """
     Read data from a file and return token and label indices, vocabulary, and label vocabulary.
 
@@ -230,23 +231,33 @@ def read_tagged_file(file_name, window_size=2, words_vocabulary=None, tags_vocab
             words.append(word)
             tags.append(tag)
 
-    if not words_vocabulary:
+    if not words_vocabulary:  # if in train case
         words_vocabulary = set(all_words)
         words_vocabulary.add("<PAD>")  # add a padding token
         words_vocabulary.add("<UUUNKKK>")  # add an unknown token
-        if pretrained_words_vocab:
+        if is_pretrained:  # if tagger2 case, loading from embedding matrix
             train_missing_embeddings = [word for word in words_vocabulary if word not in pretrained_words_vocab]
-            pretrained_words_vocab = [(word, vec for word, vec in zip(pretrained_words_vocab, embedding_vecs))]
-            # pretrained_words_vocab.extend([word])
-    if not tags_vocabulary:
+            for word in train_missing_embeddings:
+                size = embedding_vecs.shape[1]  # Get the size of the vector
+                vector = torch.empty(1, size)
+                nn.init.xavier_uniform_(vector)  # Apply Xavier uniform initialization
+                embedding_vecs = torch.cat((embedding_vecs, vector), dim=0)  # add as last row
+                pretrained_words_vocab.append(word)  # add as last word
+            # if we're using pretrained embeddings, the vocabulary changes. turning this into a set doesn't change
+            # the size, these are already unique words.
+            words_vocabulary = pretrained_words_vocab
+
+    if not tags_vocabulary:  # if in train case
         tags_vocabulary = set(all_tags)
 
     # Map words to their corresponding index in the vocabulary (word:idx)
+    # this adjusted to the new vocabulary if we use pretrained too.
     words_idx_dict = {word: i for i, word in enumerate(words_vocabulary)}
     tags_idx_dict = {tag: i for i, tag in enumerate(tags_vocabulary)}
 
     # For each window, map tokens to their index in the vocabulary
-    words_idx = [words_idx_dict[word] if word in words_idx_dict.keys() else words_idx_dict["<UUUNKKK>"] for word in all_words]
+    words_idx = [words_idx_dict[word] if word in words_idx_dict.keys() else words_idx_dict["<UUUNKKK>"] for word in
+                 all_words]
 
     # tokens_idx = torch.from_numpy(tokens_idx)
     tags_idx = [tags_idx_dict[tag] for tag in all_tags]
@@ -263,7 +274,9 @@ def read_tagged_file(file_name, window_size=2, words_vocabulary=None, tags_vocab
                 for j in range(window_size - i):
                     window.append(words_idx_dict["<PAD>"])
             extra_words = words[max(0, i - window_size):min(len(words), i + window_size + 1)]
-            window.extend([words_idx_dict[word] if word in words_idx_dict.keys() else words_idx_dict["<UUUNKKK>"] for word in extra_words])
+            window.extend(
+                [words_idx_dict[word] if word in words_idx_dict.keys() else words_idx_dict["<UUUNKKK>"] for word in
+                 extra_words])
             if i > len(words) - window_size - 1:
                 for j in range(i - (len(words) - window_size - 1)):
                     window.append(words_idx_dict["<PAD>"])
@@ -272,7 +285,11 @@ def read_tagged_file(file_name, window_size=2, words_vocabulary=None, tags_vocab
             else:
                 windows.append((window, tags_idx_dict[tags[i]]))
 
-    return torch.tensor(tags_idx), windows, words_vocabulary, tags_vocabulary, tags_idx_dict, all_words
+    if embedding_vecs != None:
+        return torch.tensor(tags_idx), windows, words_vocabulary, tags_vocabulary, tags_idx_dict, all_words, \
+               embedding_vecs
+    else:
+        return torch.tensor(tags_idx), windows, words_vocabulary, tags_vocabulary, tags_idx_dict, all_words, None
 
 
 def plot_results(dev_loss, dev_accuracy, dev_accuracy_no_o, task):
@@ -300,7 +317,6 @@ def load_pretrained_embedding(vocab_path, word_vectors_path):
     with open(vocab_path, "r", encoding="utf-8") as file:
         vocab = file.readlines()
         vocab = [word.strip() for word in vocab]
-        vocab = set(vocab)
     vecs = np.loadtxt(word_vectors_path)
     vecs = torch.from_numpy(vecs)
     vecs = vecs.float()
@@ -308,27 +324,37 @@ def load_pretrained_embedding(vocab_path, word_vectors_path):
 
 
 def run(embed, task):
-
     if embed == "pre":
         words_embedding_vocabulary, embedding_vecs = load_pretrained_embedding("vocab.txt", "wordVectors.txt")
-        tags_idx, windows, words_vocabulary, tags_vocabulary, tags_idx_dict, _ = read_tagged_file(
-            f"./{task}/train", file_type="train", pretrained_words_vocab=words_embedding_vocabulary, embedding_vecs=embedding_vecs)
+        tags_idx, windows, words_vocabulary, tags_vocabulary, tags_idx_dict, _, embedding_vecs = \
+            read_tagged_file(
+                f"./{task}/train", file_type="train", pretrained_words_vocab=words_embedding_vocabulary,
+                embedding_vecs=embedding_vecs, is_pretrained=True)
+
+        tags_idx_dev, windows_dev, _, _, _, _, _ = read_tagged_file(
+            f"./{task}/dev", words_vocabulary=words_vocabulary, tags_vocabulary=tags_vocabulary, file_type="dev",
+            is_pretrained=True)
 
         embedding_matrix = nn.Embedding.from_pretrained(embedding_vecs, freeze=False)
     else:
         tags_idx, windows, words_vocabulary, tags_vocabulary, tags_idx_dict, _ = read_tagged_file(
-            f"./{task}/train", file_type="train")
+            f"./{task}/train", file_type="train", is_pretrained=False)
+
+        tags_idx_dev, windows_dev, _, _, _, _, _ = read_tagged_file(
+            f"./{task}/dev", words_vocabulary=words_vocabulary, tags_vocabulary=tags_vocabulary, file_type="dev",
+            is_pretrained=False)
 
         # initialize model and embedding matrix and dataset
         embedding_matrix = nn.Embedding(len(words_vocabulary), EMBEDDING_DIMS)
         nn.init.xavier_uniform_(embedding_matrix.weight)
 
-
-    tags_idx_dev, windows_dev, _, _, _, _ = read_tagged_file(
+    tags_idx_dev, windows_dev, _, _, _, _, _ = read_tagged_file(
         f"./{task}/dev", words_vocabulary=words_vocabulary, tags_vocabulary=tags_vocabulary, file_type="dev")
 
     model = Tagger(task, tags_vocabulary, embedding_matrix)
     word_window_idx = torch.tensor([window for window, tag in windows])
+
+    # the windows were generated according to the new pretrained vocab (plus missing from train) if we use pretrained.
     word_window_idx_dev = torch.tensor([window for window, tag in windows_dev])
     dataset = TensorDataset(word_window_idx, tags_idx)
     dev_dataset = TensorDataset(word_window_idx_dev, tags_idx_dev)
@@ -340,6 +366,9 @@ def run(embed, task):
         lr = 0.0001
         epochs = 15
 
+    if embed == "pre":
+        lr += 0.0004
+
     # train model
     dev_loss, dev_accuracy, dev_accuracy_no_o = train_model(
         model, input_data=dataset, dev_data=dev_dataset, tags_idx_dict=tags_idx_dict, epochs=epochs, lr=lr)
@@ -348,7 +377,7 @@ def run(embed, task):
     plot_results(dev_loss, dev_accuracy, dev_accuracy_no_o, task)
 
     print("Test")
-    _, windows_test, _, _, _, all_test_words = \
+    _, windows_test, _, _, _, all_test_words, _ = \
         read_tagged_file(f"./{task}/test", words_vocabulary=words_vocabulary, tags_vocabulary=tags_vocabulary,
                          file_type="test")
 

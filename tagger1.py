@@ -187,7 +187,10 @@ def create_test_predictions(model, input_data, task, idx_tags_dict, all_test_wor
 
     with open(f"test1_{embed}_{sub_word_method}.{task}", "w") as f:
         for pred in predictions:
-            f.write(f"{pred[0]} {pred[1]}" + "\n")
+            if task == "ner":
+                f.write(f"{pred[0]}\t{pred[1]}\n")
+            else:
+                f.write(f"{pred[0]} {pred[1]}\n")
 
 
 def read_tagged_file(file_name, window_size=2, words_vocabulary=None, tags_vocabulary=None, file_type="train",

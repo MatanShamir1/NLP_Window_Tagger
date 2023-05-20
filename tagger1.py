@@ -184,7 +184,7 @@ def create_test_predictions(model, input_data, task, idx_tags_dict, all_test_wor
 
 
 def read_tagged_file(file_name, window_size=2, words_vocabulary=None, tags_vocabulary=None, file_type="train",
-                     pretrained_words_vocab=None, embedding_vecs=None, is_pretrained=False):
+                     pretrained_words_vocab=None, embedding_vecs=None, is_pretrained=False, is_subword=False):
     """
     Read data from a file and return token and label indices, vocabulary, and label vocabulary.
 
@@ -201,7 +201,12 @@ def read_tagged_file(file_name, window_size=2, words_vocabulary=None, tags_vocab
     """
     all_words = []
     all_tags = []
+    all_pre_words = []
+    all_suf_words = []
+    suf_vocab = None
+    pre_vocab = None
 
+    # the sentences always remain the same, regardless of the method used: an index for each word.
     with open(file_name) as f:
         lines = f.readlines()
         # lines = [line.strip() for line in lines if line.strip()]
@@ -214,7 +219,7 @@ def read_tagged_file(file_name, window_size=2, words_vocabulary=None, tags_vocab
                 words = []
                 tags = []
                 continue
-            if file_type != "test":
+            if file_type != "test":  # keep words in the same case if in test.
                 if "ner" in file_name:
                     word, tag = line.split('\t')
                 else:
@@ -226,15 +231,32 @@ def read_tagged_file(file_name, window_size=2, words_vocabulary=None, tags_vocab
                 word = line.strip()
                 tag = ""
             if any(char.isdigit() for char in word) and tag == "O":
-                word = "<NUM>"
+                word = "NUM"
             all_words.append(word)
+            if is_subword:
+                if len(word) < 3:
+                    all_pre_words.append(word)
+                    all_suf_words.append(word)
+                else:
+                    all_pre_words.append(word[:3])
+                    all_suf_words.append(word[-3:])
             words.append(word)
             tags.append(tag)
 
     if not words_vocabulary:  # if in train case
+        if is_subword:
+            pre_vocab = set(all_pre_words)
+            suf_vocab = set(all_suf_words)
+            pre_vocab.add("PAD")  # add a padding token
+            pre_vocab.add("UNK")  # add an unknown token
+            suf_vocab.add("PAD")  # add a padding token
+            suf_vocab.add("UNK")  # add an unknown token
+            # no need to add NUM to pre and suf because it was already generated
+
         words_vocabulary = set(all_words)
-        words_vocabulary.add("<PAD>")  # add a padding token
-        words_vocabulary.add("<UUUNKKK>")  # add an unknown token
+        words_vocabulary.add("PAD")  # add a padding token
+        words_vocabulary.add("UNK")  # add an unknown token
+
         if is_pretrained:  # if tagger2 case, loading from embedding matrix
             train_missing_embeddings = [word for word in words_vocabulary if word not in pretrained_words_vocab]
             for word in train_missing_embeddings:
@@ -255,9 +277,8 @@ def read_tagged_file(file_name, window_size=2, words_vocabulary=None, tags_vocab
     words_idx_dict = {word: i for i, word in enumerate(words_vocabulary)}
     tags_idx_dict = {tag: i for i, tag in enumerate(tags_vocabulary)}
 
-    # For each window, map tokens to their index in the vocabulary
-    words_idx = [words_idx_dict[word] if word in words_idx_dict.keys() else words_idx_dict["<UUUNKKK>"] for word in
-                 all_words]
+    pre_words_idx_dict = {pre_word: i for i, pre_word in enumerate(pre_vocab)}
+    suf_words_idx_dict = {suf_word: i for i, suf_word in enumerate(suf_vocab)}
 
     # tokens_idx = torch.from_numpy(tokens_idx)
     tags_idx = [tags_idx_dict[tag] for tag in all_tags]
@@ -266,47 +287,86 @@ def read_tagged_file(file_name, window_size=2, words_vocabulary=None, tags_vocab
     # for token of index i, w_i the window is: ([w_i-2,w_i-1 i, w_i+1,w_i+2],label of w_i)
     windows = []
 
-    for sentence in sentences:
-        words, tags = sentence
-        for i in range(len(words)):
-            window = []
-            if i < window_size:
-                for j in range(window_size - i):
-                    window.append(words_idx_dict["<PAD>"])
-            extra_words = words[max(0, i - window_size):min(len(words), i + window_size + 1)]
-            window.extend(
-                [words_idx_dict[word] if word in words_idx_dict.keys() else words_idx_dict["<UUUNKKK>"] for word in
-                 extra_words])
-            if i > len(words) - window_size - 1:
-                for j in range(i - (len(words) - window_size - 1)):
-                    window.append(words_idx_dict["<PAD>"])
-            if file_type == "test":
-                windows.append((window, 0))
-            else:
-                windows.append((window, tags_idx_dict[tags[i]]))
-
-    if embedding_vecs != None:
-        return torch.tensor(tags_idx), windows, words_vocabulary, tags_vocabulary, tags_idx_dict, all_words, \
-               embedding_vecs
+    if is_subword:
+        for sentence in sentences:
+            words, tags = sentence
+            for i in range(len(words)):
+                window = []
+                if i < window_size:
+                    for j in range(window_size - i):
+                        window.append((pre_words_idx_dict["PAD"], words_idx_dict["PAD"], suf_words_idx_dict["PAD"]))
+                extra_words = words[max(0, i - window_size):min(len(words), i + window_size + 1)]
+                window.extend(
+                    [(pre_words_idx_dict[word.lower()], words_idx_dict[word.lower()], suf_words_idx_dict[word.lower()])
+                     if word.lower() in words_idx_dict.keys() else
+                     (pre_words_idx_dict["UNK"], words_idx_dict["UNK"], suf_words_idx_dict["UNK"])
+                     for word in extra_words]
+                )
+                if i > len(words) - window_size - 1:
+                    for j in range(i - (len(words) - window_size - 1)):
+                        window.append((pre_words_idx_dict["PAD"], words_idx_dict["PAD"], suf_words_idx_dict["PAD"]))
+                if file_type == "test":
+                    windows.append((window, 0))
+                else:
+                    windows.append((window, tags_idx_dict[tags[i]]))
     else:
-        return torch.tensor(tags_idx), windows, words_vocabulary, tags_vocabulary, tags_idx_dict, all_words, None
+        for sentence in sentences:
+            words, tags = sentence
+            for i in range(len(words)):
+                window = []
+                if i < window_size:
+                    for j in range(window_size - i):
+                        window.append(words_idx_dict["PAD"])
+                extra_words = words[max(0, i - window_size):min(len(words), i + window_size + 1)]
+                window.extend(
+                    [words_idx_dict[word.lower()] if word.lower() in words_idx_dict.keys() else words_idx_dict["UNK"]
+                     for word in extra_words])
+                if i > len(words) - window_size - 1:
+                    for j in range(i - (len(words) - window_size - 1)):
+                        window.append(words_idx_dict["PAD"])
+                if file_type == "test":
+                    windows.append((window, 0))
+                else:
+                    windows.append((window, tags_idx_dict[tags[i]]))
+
+    if is_subword:
+        if embedding_vecs != None:
+            return torch.tensor(tags_idx), windows, words_vocabulary, tags_vocabulary, tags_idx_dict, all_words, \
+                embedding_vecs, pre_vocab, suf_vocab
+        else:
+            return torch.tensor(tags_idx), windows, words_vocabulary, tags_vocabulary, tags_idx_dict, all_words, None, \
+                pre_vocab, suf_vocab
+
+    else:
+        if embedding_vecs != None:
+            return torch.tensor(tags_idx), windows, words_vocabulary, tags_vocabulary, tags_idx_dict, all_words, \
+                embedding_vecs, None, None
+        else:
+            return torch.tensor(tags_idx), windows, words_vocabulary, tags_vocabulary, tags_idx_dict, all_words, None, \
+                None, None
+
+
+import matplotlib.pyplot as plt
 
 
 def plot_results(dev_loss, dev_accuracy, dev_accuracy_no_o, task):
-    # # Plot the dev loss, and save
+    # Plot the dev loss, and save
+    plt.figure()  # Create a new figure
     plt.plot(dev_loss, label=f"{task} dev loss")
     plt.title(f"{task} task")
     plt.savefig(f"{task}_loss.jpg")
     plt.show()
 
-    # # Plot the dev accuracy, and save
+    # Plot the dev accuracy, and save
+    plt.figure()  # Create a new figure
     plt.plot(dev_accuracy, label=f"{task} dev accuracy")
     plt.title(f"{task} task")
     plt.savefig(f"{task}_accuracy.jpg")
     plt.show()
 
     if task == "ner":
-        # # Plot the dev accuracy no O, and save
+        # Plot the dev accuracy no O, and save
+        plt.figure()  # Create a new figure
         plt.plot(dev_accuracy_no_o, label=f"{task} dev accuracy without O")
         plt.title(f"{task} task")
         plt.savefig(f"{task}_without_O_accuracy.jpg")
@@ -323,33 +383,55 @@ def load_pretrained_embedding(vocab_path, word_vectors_path):
     return vocab, vecs
 
 
-def run(embed, task):
-    if embed == "pre":
-        words_embedding_vocabulary, embedding_vecs = load_pretrained_embedding("vocab.txt", "wordVectors.txt")
-        tags_idx, windows, words_vocabulary, tags_vocabulary, tags_idx_dict, _, embedding_vecs = \
-            read_tagged_file(
-                f"./{task}/train", file_type="train", pretrained_words_vocab=words_embedding_vocabulary,
-                embedding_vecs=embedding_vecs, is_pretrained=True)
+def run(task, embed, sub_word_method):
+    if sub_word_method == "sub_word":
+        if embed == "pre":
+            words_embedding_vocabulary, embedding_vecs = load_pretrained_embedding("vocab.txt", "wordVectors.txt")
+            tags_idx, windows, words_vocabulary, tags_vocabulary, tags_idx_dict, _, embedding_vecs = \
+                read_tagged_file(
+                    f"./{task}/train", file_type="train", pretrained_words_vocab=words_embedding_vocabulary,
+                    embedding_vecs=embedding_vecs, is_pretrained=True, is_subword=True)
 
-        tags_idx_dev, windows_dev, _, _, _, _, _ = read_tagged_file(
-            f"./{task}/dev", words_vocabulary=words_vocabulary, tags_vocabulary=tags_vocabulary, file_type="dev",
-            is_pretrained=True)
+            tags_idx_dev, windows_dev, _, _, _, _, _ = read_tagged_file(
+                f"./{task}/dev", words_vocabulary=words_vocabulary, tags_vocabulary=tags_vocabulary, file_type="dev",
+                is_pretrained=True, is_subword=True)
 
-        embedding_matrix = nn.Embedding.from_pretrained(embedding_vecs, freeze=False)
+            embedding_matrix = nn.Embedding.from_pretrained(embedding_vecs, freeze=False)
+        else:
+            tags_idx, windows, words_vocabulary, tags_vocabulary, tags_idx_dict, _, _ = read_tagged_file(
+                f"./{task}/train", file_type="train", is_pretrained=False, is_subword=True)
+
+            tags_idx_dev, windows_dev, _, _, _, _, _ = read_tagged_file(
+                f"./{task}/dev", words_vocabulary=words_vocabulary, tags_vocabulary=tags_vocabulary, file_type="dev",
+                is_pretrained=False, is_subword=True)
+            # initialize model and embedding matrix and dataset
+            embedding_matrix = nn.Embedding(len(words_vocabulary), EMBEDDING_DIMS)
+            nn.init.xavier_uniform_(embedding_matrix.weight)
+
     else:
-        tags_idx, windows, words_vocabulary, tags_vocabulary, tags_idx_dict, _ = read_tagged_file(
-            f"./{task}/train", file_type="train", is_pretrained=False)
+        if embed == "pre":
+            words_embedding_vocabulary, embedding_vecs = load_pretrained_embedding("vocab.txt", "wordVectors.txt")
+            tags_idx, windows, words_vocabulary, tags_vocabulary, tags_idx_dict, _, embedding_vecs = \
+                read_tagged_file(
+                    f"./{task}/train", file_type="train", pretrained_words_vocab=words_embedding_vocabulary,
+                    embedding_vecs=embedding_vecs, is_pretrained=True, is_subword=False)
 
-        tags_idx_dev, windows_dev, _, _, _, _, _ = read_tagged_file(
-            f"./{task}/dev", words_vocabulary=words_vocabulary, tags_vocabulary=tags_vocabulary, file_type="dev",
-            is_pretrained=False)
+            tags_idx_dev, windows_dev, _, _, _, _, _ = read_tagged_file(
+                f"./{task}/dev", words_vocabulary=words_vocabulary, tags_vocabulary=tags_vocabulary, file_type="dev",
+                is_pretrained=True, is_subword=False)
 
-        # initialize model and embedding matrix and dataset
-        embedding_matrix = nn.Embedding(len(words_vocabulary), EMBEDDING_DIMS)
-        nn.init.xavier_uniform_(embedding_matrix.weight)
+            embedding_matrix = nn.Embedding.from_pretrained(embedding_vecs, freeze=False)
+        else:
+            tags_idx, windows, words_vocabulary, tags_vocabulary, tags_idx_dict, _, _ = read_tagged_file(
+                f"./{task}/train", file_type="train", is_pretrained=False, is_subword=False)
 
-    tags_idx_dev, windows_dev, _, _, _, _, _ = read_tagged_file(
-        f"./{task}/dev", words_vocabulary=words_vocabulary, tags_vocabulary=tags_vocabulary, file_type="dev")
+            tags_idx_dev, windows_dev, _, _, _, _, _ = read_tagged_file(
+                f"./{task}/dev", words_vocabulary=words_vocabulary, tags_vocabulary=tags_vocabulary, file_type="dev",
+                is_pretrained=False, is_subword=False)
+
+            # initialize model and embedding matrix and dataset
+            embedding_matrix = nn.Embedding(len(words_vocabulary), EMBEDDING_DIMS)
+            nn.init.xavier_uniform_(embedding_matrix.weight)
 
     model = Tagger(task, tags_vocabulary, embedding_matrix)
     word_window_idx = torch.tensor([window for window, tag in windows])
@@ -389,5 +471,6 @@ def run(embed, task):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 3 and sys.argv[1] in ["pre", "rand"] and sys.argv[2] in ["ner", "pos"]:
-        run(sys.argv[1], sys.argv[2])
+    if len(sys.argv) == 4 and sys.argv[1] in ["ner", "pos"] and sys.argv[2] in ["pre", "rand"] \
+            and sys.argv[3] in ["sub_word", "all_word"]:
+        run(sys.argv[1], sys.argv[2], sys.argv[3])

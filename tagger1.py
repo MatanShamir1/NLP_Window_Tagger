@@ -428,7 +428,8 @@ def read_tagged_file(file_name, window_size=2, words_vocabulary=None, tags_vocab
                         indices_chars = [char_to_idx[char] for char in "PAD"]
                         while len(indices_chars) <= longest_word_len:
                             indices_chars.append(-1)
-                        window.append((indices_chars, words_idx_dict["PAD"]))
+                        indices_chars.append(words_idx_dict["PAD"])
+                        window.append(indices_chars)
                 extra_words = words[max(0, i - window_size):min(len(words), i + window_size + 1)]
                 for word in extra_words:
                     if is_pretrained:
@@ -437,32 +438,37 @@ def read_tagged_file(file_name, window_size=2, words_vocabulary=None, tags_vocab
                             indices_chars = [char_to_idx[char] for char in word.lower()]
                             while len(indices_chars) <= longest_word_len:
                                 indices_chars.append(-1)
-                            window.append((indices_chars, word_in_tuple))
+                            indices_chars.append(word_in_tuple)
+                            window.append(indices_chars)
                         else:
                             word_in_tuple = words_idx_dict["UNK"]
                             indices_chars = [char_to_idx[char] for char in "UNK"]
                             while len(indices_chars) <= longest_word_len:
                                 indices_chars.append(-1)
-                            window.append((indices_chars, word_in_tuple))
+                            indices_chars.append(word_in_tuple)
+                            window.append(indices_chars)
                     else:
                         if word in words_idx_dict.keys():
                             word_in_tuple = words_idx_dict[word]
                             indices_chars = [char_to_idx[char] for char in word]
                             while len(indices_chars) <= longest_word_len:
                                 indices_chars.append(-1)
-                            window.append((indices_chars, word_in_tuple))
+                            indices_chars.append(word_in_tuple)
+                            window.append(indices_chars)
                         else:
                             word_in_tuple = words_idx_dict["UNK"]
                             indices_chars = [char_to_idx[char] for char in "UNK"]
                             while len(indices_chars) <= longest_word_len:
                                 indices_chars.append(-1)
-                            window.append((indices_chars, word_in_tuple))
+                            indices_chars.append(word_in_tuple)
+                            window.append(indices_chars)
                 if i > len(words) - window_size - 1:
                     for j in range(i - (len(words) - window_size - 1)):
                         indices_chars = [char_to_idx[char] for char in "PAD"]
                         while len(indices_chars) <= longest_word_len:
                             indices_chars.append(-1)
-                        window.append((indices_chars, words_idx_dict["PAD"]))
+                        indices_chars.append(words_idx_dict["PAD"])
+                        window.append(indices_chars)
                 if file_type == "test":
                     windows.append((window, 0))
                 else:

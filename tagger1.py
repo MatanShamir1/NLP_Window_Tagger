@@ -10,6 +10,7 @@ import string
 
 EMBEDDING_DIMS = 50
 
+
 class Tagger(nn.Module):
     """
     A sequence tagger,where
@@ -31,25 +32,24 @@ class Tagger(nn.Module):
         super(Tagger, self).__init__()
 
         # 5 concat of 50 dimensional embedding vectors
-        input_size = embedding_matrix.embedding_dim * (2 * window_size + 1)
-        hidden_size = 500
-        output_size = len(tags_vocabulary)
+        self.window_size = window_size
+        self.input_size = embedding_matrix.embedding_dim * (2 * window_size + 1)
+        self.hidden_size = 500
+        self.output_size = len(tags_vocabulary)
         self.embedding_matrix = embedding_matrix
         self.pre_embedding_matrix = pre_embedding_matrix
         self.suf_embedding_matrix = suf_embedding_matrix
         if char_embedding != None:
             # CharsCNN parameters
             self.char_embedding = char_embedding
-            self.chars_cnn = CharsCNN(
-                char_embedding,
-                num_filters=30,
-                window_size=3,
-                max_word_len=max_word_len,
-                char_to_idx=char_to_idx,
-            )
-        self.input = nn.Linear(input_size, hidden_size)
+            num_filters = 30
+            self.chars_cnn = CharsCNN(char_embedding, num_filters=num_filters, filter_size=3)
+            # change input size, because we concat char embeddings after CNN too. CNN output=
+            self.input_size += num_filters * (
+                    2 * window_size + 1)  # each word size grew by num_filters, which is output of CNN
+        self.input = nn.Linear(self.input_size, self.hidden_size)
         self.tanh = nn.Tanh()
-        self.output = nn.Linear(hidden_size, output_size)
+        self.output = nn.Linear(self.hidden_size, self.output_size)
         self.softmax = nn.Softmax(dim=1)
         self.dropout = nn.Dropout(p=0.5)
         self.task = task
@@ -60,11 +60,18 @@ class Tagger(nn.Module):
             pre_x, word_x, suf_x = x[:, :, 0], x[:, :, 1], x[:, :, 2]
             x = self.pre_embedding_matrix(pre_x).view(-1, 250) + \
                 self.embedding_matrix(word_x).view(-1, 250) + \
-                self.suf_embedding_matrix(suf_x).view(-1, 250)
+                self.suf_embedding_matrix(suf_x).view(-1, 250)  # after the view its 32*250 instead of 32*5*50
         elif self.char_embedding != None:
-            chars_embedding_forward = self.chars_cnn.forward(x)
-            x = self.embedding_matrix(x).view(-1, 250)
-            x = torch.cat([x, chars_embedding_forward], dim=1)
+            # transform the batch of windows of regular words to batch of windows of concatenated words with CNN output:
+            # 32*5*50 -> 32*5*80: 32*5*50 concat 32*5*30 -> 32*5*80
+            # remember xis given with indices: instead of 50, we have 2: list and index.
+            addition_to_x = torch.empty((x.shape[0], self.window_size * 2 + 1, self.chars_cnn.num_filters))  # 32*5*30
+            for i in range(x.shape[0]):  # for every window in the batch, recreate it
+                for j in range(x.shape[1]):  # for every word in the window extend its size from 50 to 80
+                    addition_to_x[i, j] = self.chars_cnn.forward(x[i, j, 0])
+            x = torch.cat([self.embedding_matrix(x), addition_to_x], dim=3)  # 32*5*50 -> 32*5*80
+            x = x.view(-1,
+                       (self.chars_cnn.num_filters + self.embedding_matrix.embedding_dim) * (self.window_size * 2 + 1))
         else:
             x = self.embedding_matrix(x).view(-1, 250)
         x = self.input(x)
@@ -75,67 +82,39 @@ class Tagger(nn.Module):
 
 
 class CharsCNN(nn.Module):
-    def _init_(
-        self, char_embedding, num_filters, filter_size, max_word_len, char_to_idx
+    def __init__(
+            self, char_embedding, num_filters=30, filter_size=3, padding=2
     ):
-        super(CharsCNN, self)._init_()
+        super(CharsCNN, self).__init__()
         # Get the matrix of char embeddings
+        self.padding = padding
+        self.num_filters = num_filters
         self.char_embedding = char_embedding
         self.char_embedding_dim = char_embedding.embedding_dim
-        self.max_word_len = max_word_len
+        # must be size of window (how many chars in one filter) times embedding vector size.
+        self.filter_size = self.char_embedding_dim * filter_size
+        self.conv_output_dim = num_filters
 
-        # The input is the size of each char embedding
-        conv_input_dim = self.char_embedding_dim
-        conv_output_dim = conv_input_dim * num_filters
+    def forward(self, idx_lst):  # receives a list of indices, of places of chars in the embedding chars matrix.
+        self.conv_input_dim = (2 * self.padding + len(
+            idx_lst)) * self.char_embedding_dim  # look at the sequence as one long vector
+        # next layer is num_filters*num_chars, and max_pooling on num_chars gives num_filters
         self.conv1d = nn.Conv1d(
-            conv_input_dim,
-            num_filters,
-            filter_size,
+            self.conv_input_dim,
+            self.num_filters,
+            self.filter_size,
+            padding=self.padding
         )
-        # TODO: check that the output size is correct
-        self.max_pool = nn.MaxPool1d(kernel_size=max_word_len - filter_size + 1)
-        self.char_to_idx = char_to_idx
+        # kernel size is number of columns, we want to get one item from each row. they're derived from previous layer
+        self.max_pool = nn.MaxPool1d(kernel_size=self.conv_input_dim)  # make sure padding keeps input size
 
-    def forward(self, sequence):
-        global word_chars_cache
-        batch_size = sequence.shape[0]
-        # We get a batch of words, each word is a sequence of chars,
-        # we need to get the char embeddings for each char in each word
-
-        # Build a matrix of char embeddings for each word in the batch:
-        # TODO: make it more efficient with batching
-        word_matrices = []
-        padding_tensor = self.char_embedding(torch.tensor(self.char_to_idx["pad"]))
-
-        for i in range(batch_size):
-            word = sequence[i].item()
-            word = idx_to_word[word]
-            padding_front = math.floor((self.max_word_len - len(word)) / 2)
-            padding_back = self.max_word_len - len(word) - padding_front
-            # Repeat the padding tensor {padding} times
-            #padding_front_tensor = padding_tensor.repeat(padding_front, 1)
-            #padding_back_tensor = padding_tensor.repeat(padding_back, 1)
-
-            if not word in word_chars_cache:
-                word_chars_cache[word] = [self.char_to_idx[char] for char in word]
-            word = word_chars_cache[word]
-            word = [self.char_embedding(torch.tensor(char)) for char in word]
-            word = torch.stack(word)
-
-            word_matrix = nn.functional.pad(word, (0, 0, padding_front, padding_back))
-            # word_matrix = torch.cat(
-            #     (padding_front_tensor, word, padding_back_tensor), dim=0
-            # )
-            word_matrices.append(word_matrix)
-        # x = torch.flatten(input=torch.stack(word_matrices), start_dim=1)
-        x = torch.stack(word_matrices)
-
-        # conv1d expects the input to be of shape (batch_size, channels, seq_len)
-        # so we get a tensor of shape (batch_size, seq_len, channels) and then permute it
-        x = x.permute(0, 2, 1)
-        x = self.conv1d(x)
-        x = self.max_pool(x)
-        return x.squeeze()
+        # activate forward phase: first, conv on unfolded matrix
+        out = self.conv1d(self.char_embedding(idx_lst).view(-1, self.conv_input_dim))
+        out = out.unsqueeze(1)  # Add a channel dimension to the tensor
+        out = self.max_pool(out)
+        out = out.squeeze(3)  # Remove the extra dimension added by the MaxPool1d operation
+        out = out.squeeze(2)  # Remove the channel dimension
+        return out
 
 
 def train_model(model, input_data, dev_data, tags_idx_dict, epochs=1, lr=0.0001):
@@ -296,6 +275,7 @@ def read_tagged_file(file_name, window_size=2, words_vocabulary=None, tags_vocab
     all_tags = []
     all_pre_words = []
     all_suf_words = []
+    longest_word_len = 0
 
     # the sentences always remain the same, regardless of the method used: an index for each word.
     with open(file_name) as f:
@@ -326,6 +306,7 @@ def read_tagged_file(file_name, window_size=2, words_vocabulary=None, tags_vocab
                 tag = ""
             if any(char.isdigit() for char in word) and tag == "O":
                 word = "NUM"
+            longest_word_len = max(longest_word_len, len(word))
             all_words.append(word)
             if subword_method == "sub_word":
                 if len(word) < 3:
@@ -371,7 +352,7 @@ def read_tagged_file(file_name, window_size=2, words_vocabulary=None, tags_vocab
         if subword_method == "char_word":
             # Create a vocabulary of unique characters for character embeddings
             ascii_chars = set(string.ascii_letters + string.digits + string.punctuation + string.whitespace)
-            char_vocab = ascii_chars.union(set([char for word in all_words for char in word]))
+            char_vocab = ascii_chars.union(set([char for word in all_words for char in word])) # shouldn't be additions
 
     # Map words to their corresponding index in the vocabulary (word:idx)
     # this adjusted to the new vocabulary if we use pretrained too.
@@ -402,13 +383,14 @@ def read_tagged_file(file_name, window_size=2, words_vocabulary=None, tags_vocab
                 extra_words = words[max(0, i - window_size):min(len(words), i + window_size + 1)]
                 window_tuples = []
                 for word in extra_words:
-                    pre_in_tuple, word_in_tuple, suf_in_tuple = pre_words_idx_dict["UNK"], words_idx_dict["UNK"], suf_words_idx_dict["UNK"]
+                    pre_in_tuple, word_in_tuple, suf_in_tuple = pre_words_idx_dict["UNK"], words_idx_dict["UNK"], \
+                        suf_words_idx_dict["UNK"]
 
                     if is_pretrained:
                         if word.lower() in words_idx_dict.keys():
-                            pre_in_tuple, word_in_tuple, suf_in_tuple = pre_words_idx_dict[word[:3].lower()],\
-                                                                        words_idx_dict[word.lower()],\
-                                                                        suf_words_idx_dict[word[-3:].lower()]
+                            pre_in_tuple, word_in_tuple, suf_in_tuple = pre_words_idx_dict[word[:3].lower()], \
+                                words_idx_dict[word.lower()], \
+                                suf_words_idx_dict[word[-3:].lower()]
                             window_tuples.append((pre_in_tuple, word_in_tuple, suf_in_tuple))
                             continue
                         if word[:3].lower() in pre_words_idx_dict:
@@ -417,9 +399,9 @@ def read_tagged_file(file_name, window_size=2, words_vocabulary=None, tags_vocab
                             suf_in_tuple = suf_words_idx_dict[word[-3:].lower()]
                     else:
                         if word in words_idx_dict.keys():
-                            pre_in_tuple, word_in_tuple, suf_in_tuple = pre_words_idx_dict[word[:3]],\
-                                                                        words_idx_dict[word],\
-                                                                        suf_words_idx_dict[word[-3:]]
+                            pre_in_tuple, word_in_tuple, suf_in_tuple = pre_words_idx_dict[word[:3]], \
+                                words_idx_dict[word], \
+                                suf_words_idx_dict[word[-3:]]
                             window_tuples.append((pre_in_tuple, word_in_tuple, suf_in_tuple))
                             continue
                         if word[:3] in pre_words_idx_dict:
@@ -443,28 +425,44 @@ def read_tagged_file(file_name, window_size=2, words_vocabulary=None, tags_vocab
                 window = []
                 if i < window_size:
                     for j in range(window_size - i):
-                        window.append(([char_to_idx[char] for char in "PAD"], words_idx_dict["PAD"]))
+                        indices_chars = [char_to_idx[char] for char in "PAD"]
+                        while len(indices_chars) <= longest_word_len:
+                            indices_chars.append(-1)
+                        window.append((indices_chars, words_idx_dict["PAD"]))
                 extra_words = words[max(0, i - window_size):min(len(words), i + window_size + 1)]
-                window_tuples = []
                 for word in extra_words:
                     if is_pretrained:
                         if word.lower() in words_idx_dict.keys():
                             word_in_tuple = words_idx_dict[word.lower()]
-                            window_tuples.append(([char_to_idx[char] for char in word.lower()], word_in_tuple))
+                            indices_chars = [char_to_idx[char] for char in word.lower()]
+                            while len(indices_chars) <= longest_word_len:
+                                indices_chars.append(-1)
+                            window.append((indices_chars, word_in_tuple))
                         else:
                             word_in_tuple = words_idx_dict["UNK"]
-                            window_tuples.append(([char_to_idx[char] for char in "UNK"], word_in_tuple))
+                            indices_chars = [char_to_idx[char] for char in "UNK"]
+                            while len(indices_chars) <= longest_word_len:
+                                indices_chars.append(-1)
+                            window.append((indices_chars, word_in_tuple))
                     else:
                         if word in words_idx_dict.keys():
                             word_in_tuple = words_idx_dict[word]
-                            window_tuples.append(([char_to_idx[char] for char in word], word_in_tuple))
+                            indices_chars = [char_to_idx[char] for char in word]
+                            while len(indices_chars) <= longest_word_len:
+                                indices_chars.append(-1)
+                            window.append((indices_chars, word_in_tuple))
                         else:
                             word_in_tuple = words_idx_dict["UNK"]
-                            window_tuples.append(([char_to_idx[char] for char in "UNK"], word_in_tuple))
-                window.extend(window_tuples)
+                            indices_chars = [char_to_idx[char] for char in "UNK"]
+                            while len(indices_chars) <= longest_word_len:
+                                indices_chars.append(-1)
+                            window.append((indices_chars, word_in_tuple))
                 if i > len(words) - window_size - 1:
                     for j in range(i - (len(words) - window_size - 1)):
-                        window.append(([char_to_idx[char] for char in "PAD"], words_idx_dict["PAD"]))
+                        indices_chars = [char_to_idx[char] for char in "PAD"]
+                        while len(indices_chars) <= longest_word_len:
+                            indices_chars.append(-1)
+                        window.append((indices_chars, words_idx_dict["PAD"]))
                 if file_type == "test":
                     windows.append((window, 0))
                 else:
@@ -480,12 +478,12 @@ def read_tagged_file(file_name, window_size=2, words_vocabulary=None, tags_vocab
                 extra_words = words[max(0, i - window_size):min(len(words), i + window_size + 1)]
                 if is_pretrained:
                     window.extend([words_idx_dict[word.lower()] if word.lower()
-                                    in words_idx_dict.keys() else words_idx_dict["UNK"]
-                                    for word in extra_words])
+                                                                   in words_idx_dict.keys() else words_idx_dict["UNK"]
+                                   for word in extra_words])
                 else:
                     window.extend([words_idx_dict[word] if word
-                                    in words_idx_dict.keys() else words_idx_dict["UNK"]
-                                    for word in extra_words])
+                                                           in words_idx_dict.keys() else words_idx_dict["UNK"]
+                                   for word in extra_words])
                 if i > len(words) - window_size - 1:
                     for j in range(i - (len(words) - window_size - 1)):
                         window.append(words_idx_dict["PAD"])
@@ -565,10 +563,11 @@ def run(task, embed, sub_word_method):
     if sub_word_method == "sub_word":
         if embed == "pre":
             words_embedding_vocabulary, embedding_vecs = load_pretrained_embedding("vocab.txt", "wordVectors.txt")
-            tags_idx, windows, words_vocabulary, tags_vocabulary, tags_idx_dict, _,\
-            embedding_vecs, pre_vocab, suf_vocab, _, _ = \
-                read_tagged_file(f"./{task}/train", file_type="train", pretrained_words_vocab=words_embedding_vocabulary,
-                    embedding_vecs=embedding_vecs, is_pretrained=True, subword_method=sub_word_method)
+            tags_idx, windows, words_vocabulary, tags_vocabulary, tags_idx_dict, _, \
+                embedding_vecs, pre_vocab, suf_vocab, _, _ = \
+                read_tagged_file(f"./{task}/train", file_type="train",
+                                 pretrained_words_vocab=words_embedding_vocabulary,
+                                 embedding_vecs=embedding_vecs, is_pretrained=True, subword_method=sub_word_method)
 
             tags_idx_dev, windows_dev, _, _, _, _, _, _, _, _, _ = read_tagged_file(
                 f"./{task}/dev", words_vocabulary=words_vocabulary, pre_vocab=pre_vocab,
@@ -577,8 +576,8 @@ def run(task, embed, sub_word_method):
 
             embedding_matrix = nn.Embedding.from_pretrained(embedding_vecs, freeze=False)
         else:
-            tags_idx, windows, words_vocabulary, tags_vocabulary, tags_idx_dict, _, _,\
-            pre_vocab, suf_vocab, _, _ = read_tagged_file(
+            tags_idx, windows, words_vocabulary, tags_vocabulary, tags_idx_dict, _, _, \
+                pre_vocab, suf_vocab, _, _ = read_tagged_file(
                 f"./{task}/train", file_type="train", is_pretrained=False, subword_method=sub_word_method)
 
             tags_idx_dev, windows_dev, _, _, _, _, _, _, _, _, _ = read_tagged_file(
@@ -596,24 +595,25 @@ def run(task, embed, sub_word_method):
     elif sub_word_method == "char_word":
         if embed == "pre":
             words_embedding_vocabulary, embedding_vecs = load_pretrained_embedding("vocab.txt", "wordVectors.txt")
-            tags_idx, windows, words_vocabulary, tags_vocabulary, tags_idx_dict, _,\
-            embedding_vecs, _, _, char_vocab, char_to_idx = \
-                read_tagged_file(f"./{task}/train", file_type="train", pretrained_words_vocab=words_embedding_vocabulary,
-                    embedding_vecs=embedding_vecs, is_pretrained=True, subword_method=sub_word_method)
+            tags_idx, windows, words_vocabulary, tags_vocabulary, tags_idx_dict, _, \
+                embedding_vecs, _, _, char_vocab, char_to_idx = \
+                read_tagged_file(f"./{task}/train", file_type="train",
+                                 pretrained_words_vocab=words_embedding_vocabulary,
+                                 embedding_vecs=embedding_vecs, is_pretrained=True, subword_method=sub_word_method)
 
             tags_idx_dev, windows_dev, _, _, _, _, _, _, _, _, _ = read_tagged_file(
                 f"./{task}/dev", words_vocabulary=words_vocabulary, tags_vocabulary=tags_vocabulary, file_type="dev",
-                is_pretrained=True, subword_method=sub_word_method, char_to_idx=char_to_idx)
+                is_pretrained=True, subword_method=sub_word_method, char_vocab=char_vocab)
 
             embedding_matrix = nn.Embedding.from_pretrained(embedding_vecs, freeze=False)
         else:
             tags_idx, windows, words_vocabulary, tags_vocabulary, \
-            tags_idx_dict, _, _, _, _, char_vocab, char_to_idx = read_tagged_file(
+                tags_idx_dict, _, _, _, _, char_vocab, char_to_idx = read_tagged_file(
                 f"./{task}/train", file_type="train", is_pretrained=False, subword_method=sub_word_method)
 
             tags_idx_dev, windows_dev, _, _, _, _, _, _, _, _, _ = read_tagged_file(
                 f"./{task}/dev", words_vocabulary=words_vocabulary, tags_vocabulary=tags_vocabulary, file_type="dev",
-                is_pretrained=False, subword_method=sub_word_method, char_to_idx=char_to_idx)
+                is_pretrained=False, subword_method=sub_word_method, char_vocab=char_vocab)
 
             # initialize model and embedding matrix and dataset
             embedding_matrix = nn.Embedding(len(words_vocabulary), EMBEDDING_DIMS)
@@ -623,8 +623,9 @@ def run(task, embed, sub_word_method):
         if embed == "pre":
             words_embedding_vocabulary, embedding_vecs = load_pretrained_embedding("vocab.txt", "wordVectors.txt")
             tags_idx, windows, words_vocabulary, tags_vocabulary, tags_idx_dict, _, embedding_vecs, _, _, _, _ = \
-                read_tagged_file(f"./{task}/train", file_type="train", pretrained_words_vocab=words_embedding_vocabulary,
-                    embedding_vecs=embedding_vecs, is_pretrained=True, subword_method=sub_word_method)
+                read_tagged_file(f"./{task}/train", file_type="train",
+                                 pretrained_words_vocab=words_embedding_vocabulary,
+                                 embedding_vecs=embedding_vecs, is_pretrained=True, subword_method=sub_word_method)
 
             tags_idx_dev, windows_dev, _, _, _, _, _, _, _, _, _ = read_tagged_file(
                 f"./{task}/dev", words_vocabulary=words_vocabulary, tags_vocabulary=tags_vocabulary, file_type="dev",
@@ -646,8 +647,8 @@ def run(task, embed, sub_word_method):
     char_embedding = None
     if sub_word_method == "char_word":
         # initialize model and embedding matrix and dataset
-        char_embedding = torch.FloatTensor(52, 30).uniform_(-math.sqrt(3/30), math.sqrt(3/30))
-        embedding = nn.Embedding.from_pretrained(char_embedding)
+        embedding = torch.FloatTensor(len(char_vocab), 30).uniform_(-math.sqrt(3 / 30), math.sqrt(3 / 30))
+        char_embedding = nn.Embedding.from_pretrained(embedding)
     model = Tagger(task, tags_vocabulary, embedding_matrix,
                    pre_embedding_matrix=pre_embedding_matrix, suf_embedding_matrix=suf_embedding_matrix,
                    char_embedding=char_embedding)
@@ -689,11 +690,10 @@ def run(task, embed, sub_word_method):
                 lr = 0.0001
                 epochs = 10
 
-
-
     # train model
     dev_loss, dev_accuracy, dev_accuracy_no_o = train_model(model, input_data=dataset,
-        dev_data=dev_dataset, tags_idx_dict=tags_idx_dict, epochs=epochs, lr=lr)
+                                                            dev_data=dev_dataset, tags_idx_dict=tags_idx_dict,
+                                                            epochs=epochs, lr=lr)
 
     # plot the results
     plot_results(dev_loss, dev_accuracy, dev_accuracy_no_o, task, embed, sub_word_method)
@@ -707,7 +707,7 @@ def run(task, embed, sub_word_method):
     elif sub_word_method == "char_word":
         _, windows_test, _, _, _, all_test_words, _, _, _, _, _ = \
             read_tagged_file(f"./{task}/test", words_vocabulary=words_vocabulary, tags_vocabulary=tags_vocabulary,
-                             file_type="test", subword_method=sub_word_method, char_to_idx=char_to_idx)
+                             file_type="test", subword_method=sub_word_method, char_vocab=char_vocab)
     else:
         _, windows_test, _, _, _, all_test_words, _, _, _, _, _ = \
             read_tagged_file(f"./{task}/test", words_vocabulary=words_vocabulary, tags_vocabulary=tags_vocabulary,

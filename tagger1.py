@@ -68,8 +68,9 @@ class Tagger(nn.Module):
             addition_to_x = torch.empty((x.shape[0], self.window_size * 2 + 1, self.chars_cnn.num_filters))  # 32*5*30
             for i in range(x.shape[0]):  # for every window in the batch, recreate it
                 for j in range(x.shape[1]):  # for every word in the window extend its size from 50 to 80
-                    addition_to_x[i, j] = self.chars_cnn.forward(x[i, j, 0])
-            x = torch.cat([self.embedding_matrix(x), addition_to_x], dim=3)  # 32*5*50 -> 32*5*80
+                    new_idx_lst = torch.tensor([idx for idx in x[i, j, :x.shape[2] - 1] if idx != -1])
+                    addition_to_x[i, j] = self.chars_cnn.forward(new_idx_lst).reshape(self.chars_cnn.num_filters)
+            x = torch.cat([self.embedding_matrix(x[:, :, x.shape[2] - 1]), addition_to_x], dim=2)  # 32*5*50 -> 32*5*80
             x = x.view(-1,
                        (self.chars_cnn.num_filters + self.embedding_matrix.embedding_dim) * (self.window_size * 2 + 1))
         else:
@@ -92,12 +93,11 @@ class CharsCNN(nn.Module):
         self.char_embedding = char_embedding
         self.char_embedding_dim = char_embedding.embedding_dim
         # must be size of window (how many chars in one filter) times embedding vector size.
-        self.filter_size = self.char_embedding_dim * filter_size
+        self.filter_size = filter_size
         self.conv_output_dim = num_filters
 
     def forward(self, idx_lst):  # receives a list of indices, of places of chars in the embedding chars matrix.
-        self.conv_input_dim = (2 * self.padding + len(
-            idx_lst)) * self.char_embedding_dim  # look at the sequence as one long vector
+        self.conv_input_dim = self.char_embedding_dim  # look at the sequence as one long vector
         # next layer is num_filters*num_chars, and max_pooling on num_chars gives num_filters
         self.conv1d = nn.Conv1d(
             self.conv_input_dim,
@@ -106,14 +106,21 @@ class CharsCNN(nn.Module):
             padding=self.padding
         )
         # kernel size is number of columns, we want to get one item from each row. they're derived from previous layer
-        self.max_pool = nn.MaxPool1d(kernel_size=self.conv_input_dim)  # make sure padding keeps input size
+        self.max_pool = nn.MaxPool1d(kernel_size=len(idx_lst) + (2 * self.padding) - 2,
+                                     stride=len(idx_lst) + (2 * self.padding) - 2)  # make sure padding keeps input size
+
+        # Creating tensors of size 2*30 to add at the start and end
+        # padding_zeros_tensor = torch.zeros(self.padding, self.char_embedding_dim)
+        #
+        # # Concatenating the tensors
+        # concat_tensor_with_pad = torch.cat((padding_zeros_tensor,
+        #                                     self.char_embedding(idx_lst),
+        #                                     padding_zeros_tensor), dim=0).view(-1, self.conv_input_dim)
 
         # activate forward phase: first, conv on unfolded matrix
-        out = self.conv1d(self.char_embedding(idx_lst).view(-1, self.conv_input_dim))
-        out = out.unsqueeze(1)  # Add a channel dimension to the tensor
+        # out = self.conv1d(self.char_embedding(idx_lst).view(-1, self.conv_input_dim))
+        out = self.conv1d(self.char_embedding(idx_lst).permute(1,0))
         out = self.max_pool(out)
-        out = out.squeeze(3)  # Remove the extra dimension added by the MaxPool1d operation
-        out = out.squeeze(2)  # Remove the channel dimension
         return out
 
 
@@ -135,8 +142,6 @@ def train_model(model, input_data, dev_data, tags_idx_dict, epochs=1, lr=0.0001)
         for i, data in enumerate(train_loader, 0):
             x, y = data
             optimizer.zero_grad(set_to_none=True)
-
-            y_hat = model.forward(x, model.word_cnn.forward(x))
 
             y_hat = model.forward(x)
             loss = F.cross_entropy(y_hat, y)  # maybe don't need softmax and this does it alone
@@ -654,6 +659,7 @@ def run(task, embed, sub_word_method):
     if sub_word_method == "char_word":
         # initialize model and embedding matrix and dataset
         embedding = torch.FloatTensor(len(char_vocab), 30).uniform_(-math.sqrt(3 / 30), math.sqrt(3 / 30))
+        embedding = torch.cat((embedding, torch.zeros(1, 30)), dim=0)
         char_embedding = nn.Embedding.from_pretrained(embedding)
     model = Tagger(task, tags_vocabulary, embedding_matrix,
                    pre_embedding_matrix=pre_embedding_matrix, suf_embedding_matrix=suf_embedding_matrix,

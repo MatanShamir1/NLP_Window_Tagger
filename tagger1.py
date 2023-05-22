@@ -12,20 +12,6 @@ EMBEDDING_DIMS = 50
 
 
 class Tagger(nn.Module):
-    """
-    A sequence tagger,where
-    the input is a sequence of items(in our case, a sentence of natural-language words),
-    and an output is a label for each of the item.
-    The tagger will be greedy/local and window-based. For a sequence of words
-    w1,...,wn, the tag of word wi will be based on the words in a window of
-    two words to each side of the word being tagged: wi-2,wi-1,wi,wi+1,wi+2.
-    'Greedy/local' here means that the tag assignment for word i will not depend on the tags of other words
-    each word in the window will be assigned a 50 dimensional embedding vector, using an embedding matrix E.
-    MLP with one hidden layer and tanh activation function.
-    The output of the MLP will be passed through a softmax transformation, resulting in a probability distribution.
-    The network will be trained with a cross-entropy loss.
-    The vocabulary of E will be based on the words in the training set (you are not allowed to add to E words that appear only in the dev set).
-    """
 
     def __init__(self, task, tags_vocabulary, embedding_matrix, window_size=2,
                  pre_embedding_matrix=None, suf_embedding_matrix=None, char_embedding=None):
@@ -42,7 +28,7 @@ class Tagger(nn.Module):
         if char_embedding != None:
             # CharsCNN parameters
             self.char_embedding = char_embedding
-            num_filters = 30
+            num_filters = 50
             self.chars_cnn = CharsCNN(char_embedding, num_filters=num_filters, filter_size=3)
             # change input size, because we concat char embeddings after CNN too. CNN output=
             self.input_size += num_filters * (
@@ -64,15 +50,9 @@ class Tagger(nn.Module):
         elif self.char_embedding != None:
             # transform the batch of windows of regular words to batch of windows of concatenated words with CNN output:
             # 32*5*50 -> 32*5*80: 32*5*50 concat 32*5*30 -> 32*5*80
-            # remember xis given with indices: instead of 50, we have 2: list and index.
-            # addition_to_x = torch.empty((x.shape[0], self.window_size * 2 + 1, self.chars_cnn.num_filters))  # 32*5*30
-            # for i in range(x.shape[0]):  # for every window in the batch, recreate it
-            #     for j in range(x.shape[1]):  # for every word in the window extend its size from 50 to 80
-            #         new_idx_lst = torch.tensor([idx for idx in x[i, j, :x.shape[2] - 1] if idx != -1])
-            #         addition_to_x[i, j] = self.chars_cnn.forward(new_idx_lst).reshape(self.chars_cnn.num_filters)
             addition_to_x = torch.empty((x.shape[0], self.window_size * 2 + 1, self.chars_cnn.num_filters))
             for j in range(x.shape[1]):
-                addition_to_x[:, j, :] = self.chars_cnn.forward(x[:, j, :x.shape[2] - 1]).reshape(x.shape[0],
+                addition_to_x[:, j, :] = self.chars_cnn.forward(x[:, j, :max(x[:, j, x.shape[2] - 2])]).reshape(x.shape[0],
                                                                                          self.chars_cnn.num_filters)
 
             # addition_to_x = self.chars_cnn.forward(x[:, :, :x.shape[2] - 1]).reshape(x.shape[0], x.shape[1], self.chars_cnn.num_filters)
@@ -101,6 +81,7 @@ class CharsCNN(nn.Module):
         # must be size of window (how many chars in one filter) times embedding vector size.
         self.filter_size = filter_size
         self.conv_output_dim = num_filters
+        self.dropout = nn.Dropout(p=0.3)
 
     def forward(self, idx_lst):  # receives a list of indices, of places of chars in the embedding chars matrix.
         self.conv_input_dim = self.char_embedding_dim  # look at the sequence as one long vector
@@ -112,27 +93,23 @@ class CharsCNN(nn.Module):
             padding=self.padding
         )
         # kernel size is number of columns, we want to get one item from each row. they're derived from previous layer
-        self.max_pool = nn.MaxPool1d(kernel_size=idx_lst.shape[1] + (2 * self.padding) - 2,
-                                     stride=idx_lst.shape[1] + (2 * self.padding) - 2)  # make sure padding keeps input size
+        self.max_pool = nn.MaxPool1d(kernel_size=idx_lst.shape[1] + self.padding,
+                                     stride=idx_lst.shape[1] + self.padding)  # make sure padding keeps input size
 
-        # Creating tensors of size 2*30 to add at the start and end
-        # padding_zeros_tensor = torch.zeros(self.padding, self.char_embedding_dim)
-        #
-        # # Concatenating the tensors
-        # concat_tensor_with_pad = torch.cat((padding_zeros_tensor,
-        #                                     self.char_embedding(idx_lst),
-        #                                     padding_zeros_tensor), dim=0).view(-1, self.conv_input_dim)
-
-        # activate forward phase: first, conv on unfolded matrix
-        # out = self.conv1d(self.char_embedding(idx_lst).view(-1, self.conv_input_dim))
-        out = self.conv1d(self.char_embedding(idx_lst).permute(0,2,1))
+        out = self.char_embedding(idx_lst).permute(0,2,1)
+        out = self.dropout(out)
+        out = self.conv1d(out)
         out = self.max_pool(out)
         return out
 
 
 def train_model(model, input_data, dev_data, tags_idx_dict, epochs=1, lr=0.0001):
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    BATCH_SIZE = 1024
+
+    optimizer = torch.optim.Adam(list(set(list(model.parameters()) + list(model.chars_cnn.parameters())))
+                                 , lr=lr)
     model.train()  # set model to training mode
+    model.chars_cnn.train()  # set cnn model to training mode
 
     # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
 
@@ -142,7 +119,7 @@ def train_model(model, input_data, dev_data, tags_idx_dict, epochs=1, lr=0.0001)
 
     for j in range(epochs):
         train_loader = DataLoader(
-            input_data, batch_size=1024, shuffle=True, num_workers=4, pin_memory=True
+            input_data, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True
         )
         train_loss = 0
         for i, data in enumerate(train_loader, 0):
@@ -154,7 +131,6 @@ def train_model(model, input_data, dev_data, tags_idx_dict, epochs=1, lr=0.0001)
             loss.backward()
             optimizer.step()
             train_loss += loss.item()
-            # print(f"iteration {i} curr loss: {loss}")
 
         dev_loss, dev_acc, dev_acc_clean = test_model(model, dev_data, tags_idx_dict)
         dev_loss_results.append(dev_loss)
@@ -170,18 +146,6 @@ def train_model(model, input_data, dev_data, tags_idx_dict, epochs=1, lr=0.0001)
 
 
 def test_model(model, input_data, tags_idx_dict):
-    """
-    This function tests a PyTorch model on given input data and returns the validation loss, overall accuracy, and
-    accuracy excluding "O" labels. It takes in the following parameters:
-
-    - model: a PyTorch model to be tested
-    - input_data: a dataset to test the model on
-    - windows: a parameter that is not used in the function
-
-    The function first initializes a batch size of 32 and a global variable idx_to_label. It then creates a DataLoader
-    object with the input_data and the batch size, and calculates the validation loss, overall accuracy, and accuracy
-    excluding "O" labels. These values are returned as a tuple.
-    """
 
     BATCH_SIZE = 1024
 
@@ -189,6 +153,7 @@ def test_model(model, input_data, tags_idx_dict):
     running_val_loss = 0
     with torch.no_grad():
         model.eval()
+        model.chars_cnn.eval()
         count = 0
         count_no_o = 0
         to_remove = 0
@@ -228,18 +193,6 @@ def test_model(model, input_data, tags_idx_dict):
 
 
 def create_test_predictions(model, input_data, task, idx_tags_dict, all_test_words, embed, sub_word_method):
-    """
-    This function tests a PyTorch model on given input data and returns the validation loss, overall accuracy, and
-    accuracy excluding "O" labels. It takes in the following parameters:
-
-    - model: a PyTorch model to be tested
-    - input_data: a dataset to test the model on
-    - windows: a parameter that is not used in the function
-
-    The function first initializes a batch size of 32 and a global variable idx_to_label. It then creates a DataLoader
-    object with the input_data and the batch size, and calculates the validation loss, overall accuracy, and accuracy
-    excluding "O" labels. These values are returned as a tuple.
-    """
 
     BATCH_SIZE = 256
 
@@ -247,6 +200,7 @@ def create_test_predictions(model, input_data, task, idx_tags_dict, all_test_wor
     predictions = []
     with torch.no_grad():
         model.eval()
+        model.chars_cnn.eval()
         j = 0
         for _, data in enumerate(loader, 0):
             x, y = data
@@ -268,20 +222,6 @@ def create_test_predictions(model, input_data, task, idx_tags_dict, all_test_wor
 def read_tagged_file(file_name, window_size=2, words_vocabulary=None, tags_vocabulary=None, file_type="train",
                      pretrained_words_vocab=None, embedding_vecs=None, pre_vocab=None, suf_vocab=None,
                      is_pretrained=False, subword_method="all_word", char_vocab=None):
-    """
-    Read data from a file and return token and label indices, vocabulary, and label vocabulary.
-
-    Args:
-        fname (str): The name of the file to read data from.
-        window_size (int, optional): The size of the window for the token,from each side of the word. Defaults to 2.
-
-    Returns:
-        tuple: A tuple containing:
-            - tokens_idx (numpy.ndarray): An array of token indices.
-            - labels_idx (numpy.ndarray): An array of label indices.
-            - vocab (set): A set of unique tokens in the data.
-            - labels_vocab (set): A set of unique labels in the data.
-    """
     all_words = []
     all_tags = []
     all_pre_words = []
@@ -439,6 +379,7 @@ def read_tagged_file(file_name, window_size=2, words_vocabulary=None, tags_vocab
                         indices_chars = [char_to_idx[char] for char in "PAD"]
                         while len(indices_chars) <= longest_word_len:
                             indices_chars.append(len(char_vocab))
+                        indices_chars.append(len("PAD"))
                         indices_chars.append(words_idx_dict["PAD"])
                         window.append(indices_chars)
                 extra_words = words[max(0, i - window_size):min(len(words), i + window_size + 1)]
@@ -449,6 +390,7 @@ def read_tagged_file(file_name, window_size=2, words_vocabulary=None, tags_vocab
                             indices_chars = [char_to_idx[char] for char in word.lower()]
                             while len(indices_chars) <= longest_word_len:
                                 indices_chars.append(len(char_vocab))
+                            indices_chars.append(len(word))
                             indices_chars.append(word_in_tuple)
                             window.append(indices_chars)
                         else:
@@ -456,6 +398,7 @@ def read_tagged_file(file_name, window_size=2, words_vocabulary=None, tags_vocab
                             indices_chars = [char_to_idx[char] for char in "UNK"]
                             while len(indices_chars) <= longest_word_len:
                                 indices_chars.append(len(char_vocab))
+                            indices_chars.append(len("UNK"))
                             indices_chars.append(word_in_tuple)
                             window.append(indices_chars)
                     else:
@@ -464,6 +407,7 @@ def read_tagged_file(file_name, window_size=2, words_vocabulary=None, tags_vocab
                             indices_chars = [char_to_idx[char] for char in word]
                             while len(indices_chars) <= longest_word_len:
                                 indices_chars.append(len(char_vocab))
+                            indices_chars.append(len(word))
                             indices_chars.append(word_in_tuple)
                             window.append(indices_chars)
                         else:
@@ -471,6 +415,7 @@ def read_tagged_file(file_name, window_size=2, words_vocabulary=None, tags_vocab
                             indices_chars = [char_to_idx[char] for char in "UNK"]
                             while len(indices_chars) <= longest_word_len:
                                 indices_chars.append(len(char_vocab))
+                            indices_chars.append(len("UNK"))
                             indices_chars.append(word_in_tuple)
                             window.append(indices_chars)
                 if i > len(words) - window_size - 1:
@@ -478,6 +423,7 @@ def read_tagged_file(file_name, window_size=2, words_vocabulary=None, tags_vocab
                         indices_chars = [char_to_idx[char] for char in "PAD"]
                         while len(indices_chars) <= longest_word_len:
                             indices_chars.append(len(char_vocab))
+                        indices_chars.append(len("PAD"))
                         indices_chars.append(words_idx_dict["PAD"])
                         window.append(indices_chars)
                 if file_type == "test":
@@ -683,7 +629,7 @@ def run(task, embed, sub_word_method):
                 epochs = 10
                 lr = 0.0008
             elif sub_word_method == "char_word":
-                epochs = 15
+                epochs = 10
                 lr = 0.001
             else:
                 epochs = 10
@@ -693,8 +639,8 @@ def run(task, embed, sub_word_method):
                 epochs = 5
                 lr = 0.0007
             elif sub_word_method == "char_word":
-                epochs = 15
-                lr = 0.001
+                epochs = 10
+                lr = 0.0015
             else:
                 epochs = 10
                 lr = 0.0002
@@ -703,6 +649,9 @@ def run(task, embed, sub_word_method):
             if sub_word_method == "all_word":
                 lr = 0.0003
                 epochs = 12
+            elif sub_word_method == "char_word":
+                epochs = 10
+                lr = 0.001
             else:
                 lr = 0.0002
                 epochs = 15
@@ -710,6 +659,9 @@ def run(task, embed, sub_word_method):
             if sub_word_method == "all_word":
                 lr = 0.0001
                 epochs = 8
+            elif sub_word_method == "char_word":
+                epochs = 10
+                lr = 0.0015
             else:
                 lr = 0.0001
                 epochs = 10

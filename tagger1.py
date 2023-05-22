@@ -65,11 +65,17 @@ class Tagger(nn.Module):
             # transform the batch of windows of regular words to batch of windows of concatenated words with CNN output:
             # 32*5*50 -> 32*5*80: 32*5*50 concat 32*5*30 -> 32*5*80
             # remember xis given with indices: instead of 50, we have 2: list and index.
-            addition_to_x = torch.empty((x.shape[0], self.window_size * 2 + 1, self.chars_cnn.num_filters))  # 32*5*30
-            for i in range(x.shape[0]):  # for every window in the batch, recreate it
-                for j in range(x.shape[1]):  # for every word in the window extend its size from 50 to 80
-                    new_idx_lst = torch.tensor([idx for idx in x[i, j, :x.shape[2] - 1] if idx != -1])
-                    addition_to_x[i, j] = self.chars_cnn.forward(new_idx_lst).reshape(self.chars_cnn.num_filters)
+            # addition_to_x = torch.empty((x.shape[0], self.window_size * 2 + 1, self.chars_cnn.num_filters))  # 32*5*30
+            # for i in range(x.shape[0]):  # for every window in the batch, recreate it
+            #     for j in range(x.shape[1]):  # for every word in the window extend its size from 50 to 80
+            #         new_idx_lst = torch.tensor([idx for idx in x[i, j, :x.shape[2] - 1] if idx != -1])
+            #         addition_to_x[i, j] = self.chars_cnn.forward(new_idx_lst).reshape(self.chars_cnn.num_filters)
+            addition_to_x = torch.empty((x.shape[0], self.window_size * 2 + 1, self.chars_cnn.num_filters))
+            for j in range(x.shape[1]):
+                addition_to_x[:, j, :] = self.chars_cnn.forward(x[:, j, :x.shape[2] - 1]).reshape(x.shape[0],
+                                                                                         self.chars_cnn.num_filters)
+
+            # addition_to_x = self.chars_cnn.forward(x[:, :, :x.shape[2] - 1]).reshape(x.shape[0], x.shape[1], self.chars_cnn.num_filters)
             x = torch.cat([self.embedding_matrix(x[:, :, x.shape[2] - 1]), addition_to_x], dim=2)  # 32*5*50 -> 32*5*80
             x = x.view(-1,
                        (self.chars_cnn.num_filters + self.embedding_matrix.embedding_dim) * (self.window_size * 2 + 1))
@@ -106,8 +112,8 @@ class CharsCNN(nn.Module):
             padding=self.padding
         )
         # kernel size is number of columns, we want to get one item from each row. they're derived from previous layer
-        self.max_pool = nn.MaxPool1d(kernel_size=len(idx_lst) + (2 * self.padding) - 2,
-                                     stride=len(idx_lst) + (2 * self.padding) - 2)  # make sure padding keeps input size
+        self.max_pool = nn.MaxPool1d(kernel_size=idx_lst.shape[1] + (2 * self.padding) - 2,
+                                     stride=idx_lst.shape[1] + (2 * self.padding) - 2)  # make sure padding keeps input size
 
         # Creating tensors of size 2*30 to add at the start and end
         # padding_zeros_tensor = torch.zeros(self.padding, self.char_embedding_dim)
@@ -119,7 +125,7 @@ class CharsCNN(nn.Module):
 
         # activate forward phase: first, conv on unfolded matrix
         # out = self.conv1d(self.char_embedding(idx_lst).view(-1, self.conv_input_dim))
-        out = self.conv1d(self.char_embedding(idx_lst).permute(1,0))
+        out = self.conv1d(self.char_embedding(idx_lst).permute(0,2,1))
         out = self.max_pool(out)
         return out
 
@@ -432,7 +438,7 @@ def read_tagged_file(file_name, window_size=2, words_vocabulary=None, tags_vocab
                     for j in range(window_size - i):
                         indices_chars = [char_to_idx[char] for char in "PAD"]
                         while len(indices_chars) <= longest_word_len:
-                            indices_chars.append(-1)
+                            indices_chars.append(len(char_vocab))
                         indices_chars.append(words_idx_dict["PAD"])
                         window.append(indices_chars)
                 extra_words = words[max(0, i - window_size):min(len(words), i + window_size + 1)]
@@ -442,14 +448,14 @@ def read_tagged_file(file_name, window_size=2, words_vocabulary=None, tags_vocab
                             word_in_tuple = words_idx_dict[word.lower()]
                             indices_chars = [char_to_idx[char] for char in word.lower()]
                             while len(indices_chars) <= longest_word_len:
-                                indices_chars.append(-1)
+                                indices_chars.append(len(char_vocab))
                             indices_chars.append(word_in_tuple)
                             window.append(indices_chars)
                         else:
                             word_in_tuple = words_idx_dict["UNK"]
                             indices_chars = [char_to_idx[char] for char in "UNK"]
                             while len(indices_chars) <= longest_word_len:
-                                indices_chars.append(-1)
+                                indices_chars.append(len(char_vocab))
                             indices_chars.append(word_in_tuple)
                             window.append(indices_chars)
                     else:
@@ -457,21 +463,21 @@ def read_tagged_file(file_name, window_size=2, words_vocabulary=None, tags_vocab
                             word_in_tuple = words_idx_dict[word]
                             indices_chars = [char_to_idx[char] for char in word]
                             while len(indices_chars) <= longest_word_len:
-                                indices_chars.append(-1)
+                                indices_chars.append(len(char_vocab))
                             indices_chars.append(word_in_tuple)
                             window.append(indices_chars)
                         else:
                             word_in_tuple = words_idx_dict["UNK"]
                             indices_chars = [char_to_idx[char] for char in "UNK"]
                             while len(indices_chars) <= longest_word_len:
-                                indices_chars.append(-1)
+                                indices_chars.append(len(char_vocab))
                             indices_chars.append(word_in_tuple)
                             window.append(indices_chars)
                 if i > len(words) - window_size - 1:
                     for j in range(i - (len(words) - window_size - 1)):
                         indices_chars = [char_to_idx[char] for char in "PAD"]
                         while len(indices_chars) <= longest_word_len:
-                            indices_chars.append(-1)
+                            indices_chars.append(len(char_vocab))
                         indices_chars.append(words_idx_dict["PAD"])
                         window.append(indices_chars)
                 if file_type == "test":
@@ -676,6 +682,9 @@ def run(task, embed, sub_word_method):
             if sub_word_method == "all_word":
                 epochs = 10
                 lr = 0.0008
+            elif sub_word_method == "char_word":
+                epochs = 15
+                lr = 0.001
             else:
                 epochs = 10
                 lr = 0.0004
@@ -683,6 +692,9 @@ def run(task, embed, sub_word_method):
             if sub_word_method == "all_word":
                 epochs = 5
                 lr = 0.0007
+            elif sub_word_method == "char_word":
+                epochs = 15
+                lr = 0.001
             else:
                 epochs = 10
                 lr = 0.0002

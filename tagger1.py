@@ -14,7 +14,8 @@ EMBEDDING_DIMS = 50
 class Tagger(nn.Module):
 
     def __init__(self, task, tags_vocabulary, embedding_matrix, window_size=2,
-                 pre_embedding_matrix=None, suf_embedding_matrix=None, char_embedding=None):
+                 pre_embedding_matrix=None, suf_embedding_matrix=None, char_embedding=None,
+                 num_filters=30, filter_size=3, padding=2):
         super(Tagger, self).__init__()
 
         # 5 concat of 50 dimensional embedding vectors
@@ -28,8 +29,8 @@ class Tagger(nn.Module):
         if char_embedding != None:
             # CharsCNN parameters
             self.char_embedding = char_embedding
-            num_filters = 30
-            self.chars_cnn = CharsCNN(char_embedding, num_filters=num_filters, filter_size=3)
+            self.chars_cnn = CharsCNN(char_embedding=char_embedding, num_filters=num_filters, filter_size=filter_size,
+                                      padding=padding)
             # change input size, because we concat char embeddings after CNN too. CNN output=
             self.input_size += num_filters * (
                     2 * window_size + 1)  # each word size grew by num_filters, which is output of CNN
@@ -44,9 +45,9 @@ class Tagger(nn.Module):
         # get embedding vector for input
         if self.pre_embedding_matrix != None and self.suf_embedding_matrix != None:
             pre_x, word_x, suf_x = x[:, :, 0], x[:, :, 1], x[:, :, 2]
-            x = self.pre_embedding_matrix(pre_x).view(-1, 250) + \
-                self.embedding_matrix(word_x).view(-1, 250) + \
-                self.suf_embedding_matrix(suf_x).view(-1, 250)  # after the view its 32*250 instead of 32*5*50
+            x = self.pre_embedding_matrix(pre_x).view(-1, (self.window_size * 2 + 1) * self.pre_embedding_matrix.embedding_dim) + \
+                self.embedding_matrix(word_x).view(-1, (self.window_size * 2 + 1) * self.embedding_matrix.embedding_dim) + \
+                self.suf_embedding_matrix(suf_x).view(-1, (self.window_size * 2 + 1) * self.suf_embedding_matrix.embedding_dim)  # after the view its 32*250 instead of 32*5*50
         elif self.char_embedding != None:
             # transform the batch of windows of regular words to batch of windows of concatenated words with CNN output:
             # 32*5*50 -> 32*5*80: 32*5*50 concat 32*5*30 -> 32*5*80
@@ -55,12 +56,11 @@ class Tagger(nn.Module):
                 addition_to_x[:, j, :] = self.chars_cnn.forward(x[:, j, :max(x[:, j, x.shape[2] - 2])]).reshape(x.shape[0],
                                                                                          self.chars_cnn.num_filters)
 
-            # addition_to_x = self.chars_cnn.forward(x[:, :, :x.shape[2] - 1]).reshape(x.shape[0], x.shape[1], self.chars_cnn.num_filters)
             x = torch.cat([self.embedding_matrix(x[:, :, x.shape[2] - 1]), addition_to_x], dim=2)  # 32*5*50 -> 32*5*80
             x = x.view(-1,
                        (self.chars_cnn.num_filters + self.embedding_matrix.embedding_dim) * (self.window_size * 2 + 1))
         else:
-            x = self.embedding_matrix(x).view(-1, 250)
+            x = self.embedding_matrix(x).view(-1, (self.window_size * 2 + 1) * self.embedding_matrix.embedding_dim)
         x = self.input(x)
         x = self.tanh(x)
         x = self.dropout(x)
@@ -81,7 +81,7 @@ class CharsCNN(nn.Module):
         # must be size of window (how many chars in one filter) times embedding vector size.
         self.filter_size = filter_size
         self.conv_output_dim = num_filters
-        self.dropout = nn.Dropout(p=0.3)
+        self.dropout = nn.Dropout(p=0.5)
 
     def forward(self, idx_lst):  # receives a list of indices, of places of chars in the embedding chars matrix.
         self.conv_input_dim = self.char_embedding_dim  # look at the sequence as one long vector
@@ -104,12 +104,10 @@ class CharsCNN(nn.Module):
 
 
 def train_model(model, input_data, dev_data, tags_idx_dict, epochs=1, lr=0.0001):
-    BATCH_SIZE = 1024
+    BATCH_SIZE = 32
 
-    optimizer = torch.optim.Adam(list(set(list(model.parameters()) + list(model.chars_cnn.parameters())))
-                                 , lr=lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     model.train()  # set model to training mode
-    model.chars_cnn.train()  # set cnn model to training mode
 
     # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
 
@@ -137,9 +135,6 @@ def train_model(model, input_data, dev_data, tags_idx_dict, epochs=1, lr=0.0001)
         dev_acc_results.append(dev_acc)
         dev_acc_no_o_results.append(dev_acc_clean)
 
-        for name, param in model.named_parameters():
-            print(f"Layer: {name} - Mean Weight: {param.data.mean()}")
-
         print(
             f"Epoch {j + 1}/{epochs}, Loss: {train_loss / i}, Dev Loss: {dev_loss}, Dev Acc: {dev_acc}"
             f" Dev Acc Without O:{dev_acc_clean}"
@@ -150,13 +145,12 @@ def train_model(model, input_data, dev_data, tags_idx_dict, epochs=1, lr=0.0001)
 
 def test_model(model, input_data, tags_idx_dict):
 
-    BATCH_SIZE = 1024
+    BATCH_SIZE = 32
 
     loader = DataLoader(input_data, batch_size=BATCH_SIZE, shuffle=True)
     running_val_loss = 0
     with torch.no_grad():
         model.eval()
-        model.chars_cnn.eval()
         count = 0
         count_no_o = 0
         to_remove = 0
@@ -189,21 +183,20 @@ def test_model(model, input_data, tags_idx_dict):
             running_val_loss += val_loss.item()
 
     return (
-        running_val_loss / k,
-        count / (k * BATCH_SIZE),
-        count_no_o / ((k * BATCH_SIZE) - to_remove),
+        running_val_loss / (k + 1),
+        count / len(input_data),
+        count_no_o / (len(input_data) - to_remove),
     )
 
 
 def create_test_predictions(model, input_data, task, idx_tags_dict, all_test_words, embed, sub_word_method):
 
-    BATCH_SIZE = 256
+    BATCH_SIZE = 32
 
     loader = DataLoader(input_data, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
     predictions = []
     with torch.no_grad():
         model.eval()
-        model.chars_cnn.eval()
         j = 0
         for _, data in enumerate(loader, 0):
             x, y = data
@@ -633,7 +626,7 @@ def run(task, embed, sub_word_method):
                 lr = 0.0008
             elif sub_word_method == "char_word":
                 epochs = 10
-                lr = 0.001
+                lr = 0.0009
             else:
                 epochs = 10
                 lr = 0.0004

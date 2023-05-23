@@ -21,14 +21,13 @@ class Tagger(nn.Module):
         # 5 concat of 50 dimensional embedding vectors
         self.window_size = window_size
         self.input_size = embedding_matrix.embedding_dim * (2 * window_size + 1)
-        self.hidden_size = 500
+        self.hidden_size = 250
         self.output_size = len(tags_vocabulary)
         self.embedding_matrix = embedding_matrix
         self.pre_embedding_matrix = pre_embedding_matrix
         self.suf_embedding_matrix = suf_embedding_matrix
+        self.char_embedding = char_embedding
         if char_embedding != None:
-            # CharsCNN parameters
-            self.char_embedding = char_embedding
             self.chars_cnn = CharsCNN(char_embedding=char_embedding, num_filters=num_filters, filter_size=filter_size,
                                       padding=padding)
             # change input size, because we concat char embeddings after CNN too. CNN output=
@@ -104,7 +103,7 @@ class CharsCNN(nn.Module):
 
 
 def train_model(model, input_data, dev_data, tags_idx_dict, epochs=1, lr=0.0001):
-    BATCH_SIZE = 32
+    BATCH_SIZE = 256
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     model.train()  # set model to training mode
@@ -145,7 +144,7 @@ def train_model(model, input_data, dev_data, tags_idx_dict, epochs=1, lr=0.0001)
 
 def test_model(model, input_data, tags_idx_dict):
 
-    BATCH_SIZE = 32
+    BATCH_SIZE = 256
 
     loader = DataLoader(input_data, batch_size=BATCH_SIZE, shuffle=True)
     running_val_loss = 0
@@ -191,7 +190,7 @@ def test_model(model, input_data, tags_idx_dict):
 
 def create_test_predictions(model, input_data, task, idx_tags_dict, all_test_words, embed, sub_word_method):
 
-    BATCH_SIZE = 32
+    BATCH_SIZE = 256
 
     loader = DataLoader(input_data, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
     predictions = []
@@ -623,43 +622,43 @@ def run(task, embed, sub_word_method):
         if embed == "pre":
             if sub_word_method == "all_word":
                 epochs = 10
-                lr = 0.0008
-            elif sub_word_method == "char_word":
-                epochs = 10
-                lr = 0.0009
-            else:
-                epochs = 10
-                lr = 0.0004
-        else:
-            if sub_word_method == "all_word":
-                epochs = 5
-                lr = 0.0007
-            elif sub_word_method == "char_word":
-                epochs = 10
-                lr = 0.0015
-            else:
-                epochs = 10
-                lr = 0.0002
-    else:
-        if embed == "pre":
-            if sub_word_method == "all_word":
                 lr = 0.0003
-                epochs = 12
             elif sub_word_method == "char_word":
                 epochs = 10
                 lr = 0.001
             else:
+                epochs = 10
                 lr = 0.0002
-                epochs = 15
         else:
             if sub_word_method == "all_word":
+                epochs = 10
+                lr = 0.00015
+            elif sub_word_method == "char_word":
+                epochs = 10
                 lr = 0.0001
+            else:
+                epochs = 10
+                lr = 0.00009
+    else:
+        if embed == "pre":
+            if sub_word_method == "all_word":
+                lr = 0.00035
                 epochs = 8
             elif sub_word_method == "char_word":
                 epochs = 10
-                lr = 0.0015
+                lr = 0.0003
             else:
+                lr = 0.0003
+                epochs = 8
+        else:
+            if sub_word_method == "all_word":
+                lr = 0.0002
+                epochs = 6
+            elif sub_word_method == "char_word":
+                epochs = 10
                 lr = 0.0001
+            else:
+                lr = 0.00007
                 epochs = 10
 
     # train model

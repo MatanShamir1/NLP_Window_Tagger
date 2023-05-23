@@ -28,7 +28,7 @@ class Tagger(nn.Module):
         if char_embedding != None:
             # CharsCNN parameters
             self.char_embedding = char_embedding
-            num_filters = 50
+            num_filters = 30
             self.chars_cnn = CharsCNN(char_embedding, num_filters=num_filters, filter_size=3)
             # change input size, because we concat char embeddings after CNN too. CNN output=
             self.input_size += num_filters * (
@@ -136,6 +136,9 @@ def train_model(model, input_data, dev_data, tags_idx_dict, epochs=1, lr=0.0001)
         dev_loss_results.append(dev_loss)
         dev_acc_results.append(dev_acc)
         dev_acc_no_o_results.append(dev_acc_clean)
+
+        for name, param in model.named_parameters():
+            print(f"Layer: {name} - Mean Weight: {param.data.mean()}")
 
         print(
             f"Epoch {j + 1}/{epochs}, Loss: {train_loss / i}, Dev Loss: {dev_loss}, Dev Acc: {dev_acc}"
@@ -612,7 +615,7 @@ def run(task, embed, sub_word_method):
         # initialize model and embedding matrix and dataset
         embedding = torch.FloatTensor(len(char_vocab), 30).uniform_(-math.sqrt(3 / 30), math.sqrt(3 / 30))
         embedding = torch.cat((embedding, torch.zeros(1, 30)), dim=0)
-        char_embedding = nn.Embedding.from_pretrained(embedding)
+        char_embedding = nn.Embedding.from_pretrained(embedding, freeze=False)
     model = Tagger(task, tags_vocabulary, embedding_matrix,
                    pre_embedding_matrix=pre_embedding_matrix, suf_embedding_matrix=suf_embedding_matrix,
                    char_embedding=char_embedding)
